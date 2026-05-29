@@ -1,3 +1,5 @@
+> Design/internals reference. For current build state and findings, see [STATUS.md](STATUS.md) (STATUS.md is the current truth).
+
 # vddsound internals
 
 ## What it is
@@ -20,14 +22,21 @@ library is generated with `dlltool --kill-at`.
   `VDDSetDMA`, `VDDReserveIrqLine`, `VDDReleaseIrqLine`, `call_ica_hw_interrupt`,
   `MGetVdmPointer`.)
 
-## How it supersedes the built-in VSB
+## How it takes the sound ports
 
-NTVDM's startup runs `SetupInstallableVDD()` (which loads the registry `VDD`
-list and calls each DLL's `DllMain`) **before** `SbInitialize()` (which installs
-the built-in VSB's I/O hooks). The VSB is coded to fail gracefully if a port is
-already owned. So `vddsound` installs its hooks in `DLL_PROCESS_ATTACH`, takes
-the ports first, and the built-in VSB stands down. We hook the full SB range
-`0x220–0x22F` (not just the VSB's sub-ports) to guarantee it fully backs off.
+The built-in VSB does **not** exclusively own these ports — a VDD can claim them
+directly. The catch is that `VDDInstallIOHook` registers a VDD's `hVdd` only
+once (6-slot table; a second call with the same `hVdd` returns
+`ERROR_ALREADY_EXISTS`). So we make **one** `VDDInstallIOHook` call with an
+*array* of all three ranges (`0x220–0x22F`, `0x330–0x331`, `0x388–0x38B`) and a
+single unified handler that dispatches by port — not one call per range. The
+call is made from a `VDDInstallUserHook` DOS-task-create callback (fires after
+`autoexec.nt`), **not** from `DllMain` (the loader lock there forbids
+DirectSound/winmm/thread init). `hVdd` is the `DllMain` HINSTANCE.
+
+(Historical note: an early version called `VDDInstallIOHook` once per range and
+the 2nd/3rd calls failed with `183`, which was misread for many iterations as
+"the built-in VSB owns OPL/MPU." It does not. See STATUS.md.)
 
 ## Control plane vs data plane
 
