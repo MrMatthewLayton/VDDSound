@@ -33,5 +33,6 @@ Builds `build/vddsound.dll` (Homebrew `mingw-w64`) and publishes the DLL + `rede
 
 ## Licensing
 
-- vddsound original code: add a `LICENSE` of your choice.
-- `src/opl3.c` / `src/opl3.h` — **Nuked OPL3** © Nuke.YKT, **LGPL-2.1-or-later** (license headers retained).
+vddsound's original code is licensed under the **MIT License** — see [`LICENSE`](LICENSE).
+
+The bundled FM synthesiser `src/opl3.c` / `src/opl3.h` is **Nuked OPL3** © Nuke.YKT, licensed **LGPL-2.1-or-later** (original license headers retained). It is not covered by the MIT license, and a binary linking it inherits the LGPL's obligations for that component.
