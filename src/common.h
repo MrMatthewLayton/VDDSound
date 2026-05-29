@@ -5,7 +5,7 @@
  * handler calling conventions, and the ntvdm.exe register accessors are
  * declared here by hand. Layouts are taken verbatim from the ReactOS DDK
  * headers nt_vdd.h / vddsvc.h (which mirror the Microsoft DDK); the imported
- * symbol names are validated against the real target vdm/ntvdm.exe.
+ * symbol names are validated against the real target ntvdm/ntvdm.exe.
  */
 #ifndef VDDSOUND_COMMON_H
 #define VDDSOUND_COMMON_H

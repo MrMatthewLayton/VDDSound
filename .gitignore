@@ -1,14 +1,14 @@
 # CMake build output
 /build/
 
-# Publish target written by scripts/build.sh: generated vddsound.dll, copies of
-# redeploy.bat/install.reg, plus local DOS test binaries (MIDIPLAY.EXE, *.mid)
-# and trace.log. All artifacts / third-party — kept local, not versioned.
-/vddsound/
+# Publish target written by scripts/build.sh: generated vddsound.dll + a copy of
+# install.bat, plus local DOS test binaries (MIDIPLAY.EXE, *.mid) and trace.log.
+# All artifacts / third-party — kept local, not versioned.
+/release/
 
 # Microsoft NTVDM binaries used locally for reverse-engineering offsets.
 # COPYRIGHT — must NOT be committed/pushed. Supply your own XP SP3 ntvdm.exe.
-/vdm/
+/ntvdm/
 
 # Logs
 *.log

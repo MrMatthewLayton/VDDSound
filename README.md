@@ -24,12 +24,12 @@ Port ownership and FM/MIDI routing work on real XP SP3. The outstanding issue is
 ./scripts/build.sh
 ```
 
-Builds `build/vddsound.dll` (Homebrew `mingw-w64`) and publishes the DLL + `redeploy.bat` + `install.reg` into `./vddsound/` (a VM shared folder). On a **snapshotted** XP SP3 VM, run `vddsound/redeploy.bat` (kills the resident `ntvdm.exe`, copies the DLL into `C:\vddsound\`), register it once in the registry (`install.reg`), reboot, and run a DOS program. Full details and the stale-DLL gotcha are in `docs/STATUS.md`.
+Builds `build/vddsound.dll` (Homebrew `mingw-w64`) and publishes just two files — the DLL + `install.bat` — into `./release/` (a VM shared folder). On a **snapshotted** XP SP3 VM, run `release/install.bat` as Administrator: it kills the resident `ntvdm.exe`, copies the DLL into `C:\vddsound\`, and registers it as an NTVDM VDD via `reg.exe`. Then run a DOS program. Full details and the stale-DLL gotcha are in `docs/STATUS.md`.
 
 ## Local-only (git-ignored, not in this repo)
 
-- `vdm/` — the target machine's `ntvdm.exe` / `vdmdbg.dll`, used locally to reverse-engineer call offsets. **Microsoft binaries — do not commit.** Supply your own from an XP SP3 install. Hard-coded RVAs in the source target `ntvdm.exe` 5.1.2600.5512 (the DLL still builds without `vdm/` present).
-- `build/`, `vddsound/` — build output and the generated publish folder.
+- `ntvdm/` — the target machine's `ntvdm.exe` / `vdmdbg.dll`, used locally to reverse-engineer call offsets. **Microsoft binaries — do not commit.** Supply your own from an XP SP3 install. Hard-coded RVAs in the source target `ntvdm.exe` 5.1.2600.5512 (the DLL still builds without `ntvdm/` present).
+- `build/`, `release/` — build output and the generated publish folder.
 
 ## Licensing
 

@@ -36,16 +36,16 @@ A statically-registered NTVDM Virtual Device Driver (`vddsound.dll`) that takes 
 ---
 
 ## Build & deploy loop
-- **Build (macOS):** `./scripts/build.sh` — builds and PUBLISHES `vddsound.dll`, `redeploy.bat`, `install.reg` into `./vddsound/` (the VM shared folder), and prints the build tag.
-- **Deploy (on the XP VM):** double-click `vddsound/redeploy.bat` — it kills the resident `ntvdm.exe` (which holds the old DLL open), copies the DLL beside it into `C:\vddsound\`, clears the log. **The first trace.log line shows the build tag** — if it's not the latest tag, you're running a stale DLL (this bit us repeatedly; always verify the tag).
-- **One-time VM setup:** register `C:\vddsound\vddsound.dll` in `HKLM\SYSTEM\ CurrentControlSet\Control\VirtualDeviceDrivers` value `VDD` (REG_MULTI_SZ); reboot. `autoexec.nt` currently has `SET BLASTER=A0` (no longer required — built-in VSB doesn't own the ports; real games want a valid `A220 I5 D1 P330 T6`).
+- **Build (macOS):** `./scripts/build.sh` — builds and PUBLISHES just two files, `vddsound.dll` + `install.bat`, into `./release/` (the VM shared folder), and prints the build tag.
+- **Deploy (on the XP VM):** double-click `release/install.bat` (run as Administrator) — it kills the resident `ntvdm.exe` (which holds the old DLL open), copies the DLL beside it into `C:\vddsound\`, clears the log, and registers the VDD via `reg.exe`. **The first trace.log line shows the build tag** — if it's not the latest tag, you're running a stale DLL (this bit us repeatedly; always verify the tag).
+- **VM setup:** none separate anymore — `install.bat` sets `HKLM\SYSTEM\CurrentControlSet\Control\VirtualDeviceDrivers` value `VDD` (REG_MULTI_SZ) to `C:\vddsound\vddsound.dll` via `reg add` on every run (idempotent; needs Administrator). Registration takes effect on the next NTVDM launch; reboot only if the DLL still won't load. `autoexec.nt` currently has `SET BLASTER=A0` (no longer required — built-in VSB doesn't own the ports; real games want a valid `A220 I5 D1 P330 T6`).
 
 ## File / module map
 ```
 docs/STATUS.md              THIS FILE — current truth + rehydration
 docs/ARCHITECTURE.md        internals/design (design-level)
-vdm/ntvdm.exe               real XP SP3 binary (5.1.2600.5512), git-ignored — RE offsets
-vdm/details.txt             the VM's real autoexec.nt/config.nt
+ntvdm/ntvdm.exe             real XP SP3 binary (5.1.2600.5512), git-ignored — RE offsets
+ntvdm/details.txt           the VM's real autoexec.nt/config.nt
 defs/ntvdm.def              import lib source (stdcall @N + dlltool -k → undecorated imports)
 cmake/toolchain-mingw-i686.cmake
 src/vdd_entry.c             DllMain, VDDInstallUserHook, single VDDInstallIOHook(3 ranges), unified dispatch, affinity
@@ -56,10 +56,9 @@ src/sb_module.c/.h          SB detection stub (no PCM)
 src/logger.c/.h             CRT-free trace logger (VDDSOUND_TRACE gates per-access I/O)
 src/crt0.c                  -nostdlib entry + mem* (XP has no UCRT)
 src/opl3.c/.h               vendored Nuked OPL3 (LGPL-2.1+)
-scripts/build.sh            build + publish to ./vddsound
-scripts/redeploy.bat        on-VM swap (self-copies DLL next to it)
-scripts/install.reg         registry registration helper
-vddsound/                   shared-folder publish target (DLL + bat + reg + user's test files)
+scripts/build.sh            build + publish to ./release
+scripts/install.bat         on-VM register + swap (reg.exe VDD + self-copies DLL beside it)
+release/                    shared-folder publish target (DLL + bat + user's test files)
 ```
 
 ## Hard-won technical findings (don't relearn these)

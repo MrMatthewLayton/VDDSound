@@ -25,12 +25,11 @@ i686-w64-mingw32-objdump -p build/vddsound.dll | grep "DLL Name"
 echo "=== built: $ROOT/build/vddsound.dll ==="
 ls -la build/vddsound.dll
 
-# 4. Publish everything the VM needs to the shared folder (./vddsound).
-PUBLISH="$ROOT/vddsound"
+# 4. Publish everything the VM needs to the shared folder (./release).
+PUBLISH="$ROOT/release"
 mkdir -p "$PUBLISH"
-cp -f build/vddsound.dll   "$PUBLISH/vddsound.dll"
-cp -f scripts/redeploy.bat "$PUBLISH/redeploy.bat"
-cp -f scripts/install.reg  "$PUBLISH/install.reg"
+cp -f build/vddsound.dll "$PUBLISH/vddsound.dll"
+cp -f scripts/install.bat "$PUBLISH/install.bat"
 
 # Surface the build tag so you can confirm what got published.
 TAG="$(strings build/vddsound.dll | grep -m1 'build \[' || true)"
@@ -38,4 +37,4 @@ echo "=== published to $PUBLISH ==="
 echo "    tag: ${TAG:-<none found>}"
 ls -la "$PUBLISH"
 echo
-echo "On the VM: open the shared folder and double-click redeploy.bat, then run your DOS program."
+echo "On the VM: open the shared folder and double-click install.bat (as Administrator), then run your DOS program."
