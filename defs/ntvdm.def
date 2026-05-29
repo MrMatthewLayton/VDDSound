@@ -1,0 +1,31 @@
+LIBRARY ntvdm.exe
+EXPORTS
+  ; ntvdm.exe exports these stdcall functions UNDECORATED. We list them with
+  ; their @N byte counts so the linker resolves the decorated references our
+  ; __stdcall prototypes emit; dlltool -k (--kill-at) strips the @N from the
+  ; name imported from the DLL at load time, matching the undecorated exports.
+  ; --- I/O hook + lifecycle (MVP) ---
+  VDDInstallIOHook@16
+  VDDDeInstallIOHook@12
+  VDDInstallUserHook@20
+  VDDDeInstallUserHook@4
+  ; --- guest register accessors for CS:IP logging (MVP) ---
+  getCS@0
+  getIP@0
+  getEIP@0
+  getDS@0
+  getES@0
+  getSS@0
+  getAX@0
+  getBX@0
+  getCX@0
+  getDX@0
+  ; --- VM services (macros in vddsvc.h resolve to these real symbols) ---
+  MGetVdmPointer@12
+  call_ica_hw_interrupt@12
+  ; --- DMA + IRQ (post-MVP; declared now to freeze the import lib) ---
+  VDDRequestDMA@16
+  VDDQueryDMA@12
+  VDDSetDMA@16
+  VDDReserveIrqLine
+  VDDReleaseIrqLine
