@@ -77,6 +77,22 @@ ULONG  WINAPI getEIP(VOID);
  * linear (seg<<4)+offset; ProtectedMode FALSE for real-mode/V86 addresses. */
 PBYTE WINAPI MGetVdmPointer(ULONG Address, ULONG Size, BOOL ProtectedMode);
 
+/* ---- DMA + IRQ (digital SB playback) ------------------------------------ */
+
+/* Transfer up to Length bytes from the guest's DMA buffer on channel iChannel
+ * into Buffer, advancing the virtual 8237 controller. Returns the number of
+ * bytes actually transferred (0 when the guest side has nothing queued). */
+ULONG WINAPI VDDRequestDMA(HANDLE hVdd, ULONG iChannel, PVOID Buffer,
+                           ULONG Length);
+
+/* Post a hardware IRQ into the guest's 8259(s). ica = controller (0 = master,
+ * lines 0-7; 1 = slave, lines 8-15), line = IRQ line on that controller, count
+ * = number of interrupts to inject. The SB completion IRQ5 is (0, 5, 1).
+ * (VDDReserveIrqLine/VDDReleaseIrqLine are in the .def but intentionally left
+ * unreferenced for now - they lack an @N byte count there, which would need
+ * fixing before they can link.) */
+VOID WINAPI call_ica_hw_interrupt(int ica, int line, int count);
+
 #ifdef __cplusplus
 }
 #endif

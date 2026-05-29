@@ -2,7 +2,7 @@
 
 **This is the single source of truth for the current state.** `docs/ARCHITECTURE.md` describes the design/internals; the root `README.md` is the front page. Where they disagree with reality, **this file wins.**
 
-Last build tag: **`[b16-baseline]`**. Target: Windows XP SP3 32-bit NTVDM. Built on macOS with Homebrew MinGW-w64 i686, CRT-free, no XP-incompatible deps.
+Last build tag: **`[b19-sbdigital]`**. Target: Windows XP SP3 32-bit NTVDM. Built on macOS with Homebrew MinGW-w64 i686, CRT-free, no XP-incompatible deps.
 
 ---
 
@@ -11,7 +11,7 @@ Last build tag: **`[b16-baseline]`**. Target: Windows XP SP3 32-bit NTVDM. Built
 A statically-registered NTVDM Virtual Device Driver (`vddsound.dll`) that takes over the legacy sound ports and routes DOS audio to the host:
 - **MIDI** (MPU-401, `0x330/0x331`) → `midiOutShortMsg`/`midiOutLongMsg` (winmm).
 - **FM** (OPL2/3, `0x388-0x38B`) → **Nuked OPL3** software synth → **DirectSound**.
-- **SB DSP** (`0x220-0x22F`) → detection stub only (reset→`0xAA`, version `0xE1`→`04 05`).
+- **SB DSP** (`0x220-0x22F`) → detection (reset→`0xAA`, version `0xE1`→`04 05`) **+ first-pass digital DMA playback** (`[b19-sbdigital]`, untested on VM): DSP command FSM → `VDDRequestDMA` → resample → mix into the FM/DirectSound buffer → IRQ5 via `call_ica_hw_interrupt`.
 - **Forensic logger** with guest CS:IP, off by default (set `VDDSOUND_TRACE=1`).
 
 ## What WORKS (verified on real XP SP3)
@@ -23,14 +23,14 @@ A statically-registered NTVDM Virtual Device Driver (`vddsound.dll`) that takes 
 
 ## What's BROKEN / unsolved
 1. **Tempo/time distortion (the big one).** DOS audio plays time-distorted ("stretched cassette", in-tune, drifting). **This is NTVDM's emulated timebase, not our code** — it hits native NTVDM, VDMSound, and us identically. Root cause: NTVDM idle-detection + PIT/BIOS-tick inaccuracy. **Nothing fixed it:** affinity, BIOS SpeedStep off, PIF Idle-Sensitivity=Low, Compatible-Timer toggle, full-screen — all no effect. Overriding the BIOS tick (`0040:006C`) from a host thread made it **worse** (fights NTVDM's IRQ0). This is the genuine NTVDM floor; even VDMSound never fixed it (it's "smooth but slow").
-2. **FM content** (Skyroads): some instruments missing / not quite right — genuinely our OPL handling (register writes applied at audio-block granularity; OPL2/3 detail).
-3. **SB digital PCM/DMA**: not implemented (detection stub only). PCM-using programs (Skyroads SFX, Duke3D, Doom menu) fail or hang the VM — expected, post-MVP.
-4. **Glitchiness vs VDMSound smoothness**: likely our small ~96 ms DirectSound ring buffer underrunning (VDMSound used ~1.5 s). Untried fix.
+2. **FM content** (Skyroads): some instruments missing / not quite right. **`[b18-oplbuf]` improved write timing** — drained register writes now go through Nuked's timestamped write buffer (`OPL3_WriteRegBuffered`), spread at hardware-accurate 2-sample spacing instead of all collapsing onto the block's first sample (worst on render-thread catch-up). **Not yet A/B'd on the VM.** OPL3 bank-1 (`0x38A/0x38B`) was already handled correctly in `opl_module.c` — the old "verify bank-1" suspicion was stale. Still open: true per-burst sample-accurate timing needs timestamps on the SPSC queue entries (the ~16 ms inter-burst quantization still stands); and SB Pro's OPL mirror at `0x220-0x223/0x228-9` isn't forwarded to the OPL core, so a game driving FM through those instead of `0x388` would lose it (Skyroads uses `0x388`, so not its cause).
+3. **SB digital PCM/DMA**: **first pass implemented in `[b19-sbdigital]` but UNTESTED on the VM** (`sb_module.c`). DSP command FSM (classic `0x14/0x1C/0x90/0x91`+`0x40`/`0x48`, SB16 `0xB0-0xCF`+`0x41`), render-thread `VDDRequestDMA` pull → linear resample → mix into the DirectSound buffer, IRQ5 via `call_ica_hw_interrupt`, mixer regs `0x224/5`. Compiles/links/zero-warnings; a real `dsp_args` overflow was caught and fixed. **Highest-risk part is IRQ pacing** (posted from the render thread, which leads the play cursor by the buffer latency — a catch-up burst could post a run of IRQs). Things to verify/tune on the VM are marked `TUNE` in the source: DMA channels (1/5), SB16 length convention, IRQ controller/line args. Until proven, PCM games may still misbehave or hang.
+4. **Glitchiness vs VDMSound smoothness**: was a small ~96 ms DirectSound ring buffer underrunning (VDMSound used ~1.5 s). **`[b17-bigbuf]` enlarged it to ~384 ms** (`audio_out.c`, `NUM_CHUNKS` 6→24) — applied in code, **not yet verified on the VM**. If glitches persist, bump `NUM_CHUNKS` further (32 ≈ 512 ms).
 
 ## Recommended next steps (ranked)
-1. **Enlarge the DirectSound buffer** (`audio_out.c`, `CHUNK_FRAMES`/`NUM_CHUNKS`, currently 768×6≈96 ms → try ~250–500 ms) to remove FM glitchiness. Cheap.
-2. **Fix FM content** — apply OPL register writes more promptly (flush on data-port write), verify OPL3 bank-1 (`0x38A/0x38B`) handling. (`opl_module.c`.)
-3. **SB16 digital DSP+DMA** path (`VDDRequestDMA`, IRQ via `call_ica_hw_interrupt`, mix PCM into the DirectSound buffer). The real differentiator; large.
+1. **Enlarge the DirectSound buffer** — **DONE in `[b17-bigbuf]`** (`audio_out.c`, `NUM_CHUNKS` 6→24 ≈ 384 ms). Pending on-VM confirmation it removes the FM glitching; headroom to ~512 ms (`NUM_CHUNKS` 32) if needed.
+2. **Fix FM content** — **partly done in `[b18-oplbuf]`** (writes now via `OPL3_WriteRegBuffered`; bank-1 verified already-correct). Still open, needs on-VM A/B testing: per-burst sample-accurate timing (timestamp the SPSC queue entries + render in segments between writes) and optionally forwarding the SB Pro OPL mirror ports to the OPL core. (`opl_module.c`.)
+3. **SB16 digital DSP+DMA** path — **first pass DONE in `[b19-sbdigital]`** (`sb_module.c`: DSP FSM, `VDDRequestDMA` pull, resample+mix, IRQ5). **Needs on-VM bring-up:** confirm DMA actually flows, then tune the `TUNE`-marked assumptions and the IRQ pacing. Remaining after that: SB16 16-bit verified, ADPCM, direct-DAC (`0x10`), high-speed/`0xD0x` edge cases, and the SB Pro stereo/mixer-volume registers.
 4. **Timebase takeover spike** (hook PIT `0x40-0x43` AND drive IRQ0, both from QPC, without fighting NTVDM). Only thing that might beat everyone on timing; high effort/fragile; may still lose. Treat as a research spike, not a commitment.
 
 ---
@@ -52,7 +52,7 @@ src/vdd_entry.c             DllMain, VDDInstallUserHook, single VDDInstallIOHook
 src/midi_module.c/.h        MPU-401 reassembly → winmm
 src/opl_module.c/.h         OPL traps → Nuked OPL3 (SPSC queue), AdLib detect
 src/audio_out.c/.h          DirectSound ring buffer + render thread
-src/sb_module.c/.h          SB detection stub (no PCM)
+src/sb_module.c/.h          SB detection + first-pass digital DMA playback (DSP FSM, VDDRequestDMA, IRQ5)
 src/logger.c/.h             CRT-free trace logger (VDDSOUND_TRACE gates per-access I/O)
 src/crt0.c                  -nostdlib entry + mem* (XP has no UCRT)
 src/opl3.c/.h               vendored Nuked OPL3 (LGPL-2.1+)

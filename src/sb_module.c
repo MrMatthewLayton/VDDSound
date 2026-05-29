@@ -1,94 +1,450 @@
 /*
- * sb_module.c - minimal Sound Blaster DSP so autodetecting games see a card,
- * and so we own the SB port range (which makes NTVDM's built-in VSB back off).
- * MVP: reset handshake (0xAA) and the DSP version query (0xE1). No PCM/DMA.
- * All handlers run on the VDM CPU thread; state is single-threaded here.
+ * sb_module.c - Sound Blaster DSP: detection + digital (DMA) PCM playback.
+ *
+ * Detection (reset->0xAA, DSP version 0xE1->4.05) plus owning the port range
+ * makes autodetecting games see an SB16 and makes NTVDM's built-in VSB back off.
+ *
+ * Digital path (FIRST PASS - needs on-VM tuning, esp. IRQ pacing):
+ *   - A DSP command FSM (VDM thread) parses the multi-byte DMA commands: classic
+ *     8-bit (0x14/0x1C/0x90/0x91 + 0x40 time-constant + 0x48 block size) and
+ *     SB16 (0xB0-0xCF + mode byte + 0x41 sample rate), plus speaker/pause/
+ *     resume/exit-auto-init. It fills a small playback control block.
+ *   - sb_mix() (audio render thread) pulls guest PCM via VDDRequestDMA, decodes
+ *     8/16-bit mono/stereo, linear-resamples to the output rate, and mixes into
+ *     the FM buffer. Pacing DMA consumption off the audio clock makes the block
+ *     completion IRQ (call_ica_hw_interrupt, IRQ5) land at about the right time;
+ *     auto-init reloads, single-cycle stops.
+ *
+ * Threading: sb_outb/sb_inb run on the VDM CPU thread; sb_mix runs on the audio
+ * render thread. The only state shared across the two threads is the digital
+ * playback control block, guarded by sb_cs (held briefly, including across the
+ * VDDRequestDMA pull, which only copies a few KB). IRQ-pending flags are atomic.
+ * The detection FIFO, mixer registers and DSP-FSM scratch are VDM-thread-only.
+ *
+ * KNOWN FIRST-PASS ASSUMPTIONS to verify on the VM (search "TUNE"):
+ *   - DMA channels hard-wired to 1 (8-bit) / 5 (16-bit) per the SB16 default.
+ *   - SB16 command length treated as (samples-1) per channel; block_bytes =
+ *     samples * (bits/8) * channels. Some drivers count differently.
+ *   - IRQ posted from the render thread, which runs AHEAD of the play cursor by
+ *     the DirectSound buffer latency; on a big catch-up burst this can post a
+ *     run of IRQs. If that floods a guest ISR, pace off the play cursor instead.
+ *   - call_ica_hw_interrupt(0, 5, 1) for IRQ5 on the master 8259.
  */
 #include "sb_module.h"
+#include "audio_out.h"   /* AUDIO_SAMPLE_RATE */
+#include "logger.h"
 
 #define SB_FIFO_SIZE 16u
 #define SB_FIFO_MASK (SB_FIFO_SIZE - 1u)
 
-static BYTE  sb_fifo[SB_FIFO_SIZE]; /* DSP -> host read-data bytes */
-static unsigned sb_fifo_head;
-static unsigned sb_fifo_tail;
-static int   sb_reset_pending;
+#define SB_DMA8   1u     /* TUNE: 8-bit DMA channel (BLASTER D1) */
+#define SB_DMA16  5u     /* TUNE: 16-bit DMA channel (BLASTER H5) */
+#define SB_IRQ    5      /* TUNE: BLASTER I5 */
 
-static void sb_fifo_clear(void)
-{
-    sb_fifo_head = sb_fifo_tail = 0;
-}
+#define SB_STAGE_RAW_BYTES 2048u   /* per-pull DMA staging (whole frames) */
+
+/* ---- detection FIFO (VDM thread only) ----------------------------------- */
+static BYTE     sb_fifo[SB_FIFO_SIZE];
+static unsigned sb_fifo_head, sb_fifo_tail;
+static int      sb_reset_pending;
+
+/* ---- mixer chip registers (VDM thread only) ----------------------------- */
+static BYTE mixer_regs[256];
+static BYTE mixer_addr;
+
+/* ---- DSP command FSM scratch (VDM thread only) -------------------------- */
+static BYTE     dsp_cmd;
+static BYTE     dsp_args[3];   /* SB16 DMA commands take 3: mode + len lo/hi */
+static int      dsp_argc, dsp_argn;
+static unsigned dsp_rate = 11025;      /* last programmed sample rate (Hz) */
+static unsigned dsp_block_bytes = 1;   /* last 0x48 block size (bytes) */
+
+/* ---- shared digital playback control block (guard with sb_cs) ----------- */
+static HANDLE           sb_hvdd;
+static CRITICAL_SECTION sb_cs;
+static volatile LONG    sb_cs_ready;
+
+static volatile int sb_play;       /* a transfer is active */
+static int      sb_paused;         /* DMA paused (0xD0/0xD5) */
+static int      sb_speaker;        /* speaker on (0xD1) - gates audible output */
+static unsigned sb_rate;           /* active playback rate (Hz) */
+static int      sb_bits;           /* 8 or 16 */
+static int      sb_stereo;         /* 0/1 */
+static int      sb_signed;         /* sample encoding signed? */
+static int      sb_autoinit;       /* 0/1 */
+static unsigned sb_channel;        /* DMA channel in use */
+static unsigned sb_block_bytes;    /* bytes per block (IRQ pacing) */
+static unsigned sb_bytes_left;     /* bytes remaining in current block */
+
+/* ---- IRQ flags (atomic; render sets, VDM acks) -------------------------- */
+static volatile LONG sb_irq8_pending;
+static volatile LONG sb_irq16_pending;
+
+/* ---- resampler + decode staging (render thread only) -------------------- */
+static BYTE     sb_raw[SB_STAGE_RAW_BYTES];
+static int16_t  sb_stage[SB_STAGE_RAW_BYTES * 2]; /* decoded stereo frames */
+static unsigned sb_stage_head, sb_stage_pos;
+static int      sb_have_cur;
+static int      sb_cur_l, sb_cur_r, sb_nxt_l, sb_nxt_r;
+static unsigned sb_phase;          /* 16.16 fractional position cur->nxt */
+
+/* ------------------------------------------------------------------------- */
+
+static void sb_fifo_clear(void) { sb_fifo_head = sb_fifo_tail = 0; }
 
 static void sb_fifo_push(BYTE b)
 {
     unsigned next = (sb_fifo_head + 1u) & SB_FIFO_MASK;
-    if (next == sb_fifo_tail) {
-        return; /* full */
-    }
+    if (next == sb_fifo_tail) return; /* full */
     sb_fifo[sb_fifo_head] = b;
     sb_fifo_head = next;
 }
 
-static int sb_fifo_empty(void)
-{
-    return sb_fifo_head == sb_fifo_tail;
-}
+static int  sb_fifo_empty(void) { return sb_fifo_head == sb_fifo_tail; }
 
 static BYTE sb_fifo_pop(void)
 {
     BYTE b;
-    if (sb_fifo_empty()) {
-        return 0xFF;
-    }
+    if (sb_fifo_empty()) return 0xFF;
     b = sb_fifo[sb_fifo_tail];
     sb_fifo_tail = (sb_fifo_tail + 1u) & SB_FIFO_MASK;
     return b;
 }
 
-void sb_init(void)
+void sb_init(HANDLE hVdd)
 {
+    sb_hvdd = hVdd;
     sb_fifo_clear();
     sb_reset_pending = 0;
+    dsp_argc = dsp_argn = 0;
+    sb_play = 0;
+    sb_speaker = 1;           /* SB16: speaker is always on (0xD1/0xD3 are no-ops) */
+    mixer_regs[0x80] = 0x02;  /* IRQ select: IRQ5 */
+    mixer_regs[0x81] = 0x22;  /* DMA select: DMA1 (8-bit) + DMA5 (16-bit) */
+    InitializeCriticalSection(&sb_cs);
+    InterlockedExchange(&sb_cs_ready, 1);
 }
+
+/* ---- digital playback start/stop (called under sb_cs) ------------------- */
+
+static void sb_post_irq(void)
+{
+    if (sb_bits == 16) InterlockedExchange(&sb_irq16_pending, 1);
+    else               InterlockedExchange(&sb_irq8_pending, 1);
+    call_ica_hw_interrupt(0, SB_IRQ, 1);
+}
+
+static void sb_start(int bits, int stereo, int sgnd, unsigned channel,
+                     int autoinit, unsigned block_bytes)
+{
+    sb_bits        = bits;
+    sb_stereo      = stereo;
+    sb_signed      = sgnd;
+    sb_channel     = channel;
+    sb_autoinit    = autoinit;
+    sb_block_bytes = block_bytes ? block_bytes : 1u;
+    sb_bytes_left  = sb_block_bytes;
+    sb_rate        = dsp_rate ? dsp_rate : 11025u;
+    sb_paused      = 0;
+    /* reset the resampler/staging so we don't reuse the previous stream. */
+    sb_have_cur    = 0;
+    sb_phase       = 0;
+    sb_stage_head  = sb_stage_pos = 0;
+    sb_play        = 1;
+    logger_note_kv("sb: dma start, rate", (unsigned long)sb_rate);
+    logger_note_kv("sb: dma start, bytes", (unsigned long)sb_block_bytes);
+}
+
+static void sb_stop(void)
+{
+    sb_play   = 0;
+    sb_paused = 0;
+}
+
+/* ---- DSP command FSM (VDM thread, under sb_cs via sb_outb) --------------- */
+
+static int dsp_arg_count(BYTE c)
+{
+    if (c >= 0xB0 && c <= 0xCF) return 3;   /* SB16 DMA: mode + len lo/hi */
+    switch (c) {
+    case 0x14: case 0x91:                   /* 8-bit single-cycle: len lo/hi */
+    case 0x41: case 0x42:                   /* sample rate: hi/lo */
+    case 0x48:                              /* block size: lo/hi */
+    case 0x80:                              /* silence: len lo/hi (ignored) */
+        return 2;
+    case 0x40:                              /* time constant */
+    case 0x10:                              /* direct DAC (ignored) */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static void dsp_execute(BYTE cmd, const BYTE *a)
+{
+    switch (cmd) {
+    case 0xE1:                              /* DSP version */
+        sb_fifo_push(SB_DSP_MAJOR);
+        sb_fifo_push(SB_DSP_MINOR);
+        break;
+    case 0x40: {                            /* set time constant */
+        unsigned tc = a[0];
+        if (tc < 256u) dsp_rate = 1000000u / (256u - tc);
+        break;
+    }
+    case 0x41: case 0x42:                   /* set sample rate (big-endian) */
+        dsp_rate = ((unsigned)a[0] << 8) | a[1];
+        break;
+    case 0x48:                              /* set DMA block size (bytes-1) */
+        dsp_block_bytes = (((unsigned)a[1] << 8) | a[0]) + 1u;
+        break;
+    case 0x14: case 0x91: {                 /* 8-bit single-cycle output */
+        unsigned len = (((unsigned)a[1] << 8) | a[0]) + 1u;
+        sb_start(8, (mixer_regs[0x0E] & 0x02) ? 1 : 0, 0, SB_DMA8, 0, len);
+        break;
+    }
+    case 0x1C: case 0x90:                   /* 8-bit auto-init output */
+        sb_start(8, (mixer_regs[0x0E] & 0x02) ? 1 : 0, 0, SB_DMA8, 1,
+                 dsp_block_bytes);
+        break;
+    case 0xD0: case 0xD5: sb_paused = 1; break;  /* pause 8/16-bit DMA */
+    case 0xD4: case 0xD6: sb_paused = 0; break;  /* resume 8/16-bit DMA */
+    case 0xD9: case 0xDA: sb_autoinit = 0; break;/* exit auto-init after block */
+    case 0xD1: sb_speaker = 1; break;            /* speaker on */
+    case 0xD3: sb_speaker = 0; break;            /* speaker off */
+    default:
+        if (cmd >= 0xB0 && cmd <= 0xCF) {        /* SB16 DMA */
+            unsigned mode = a[0];
+            unsigned len  = (((unsigned)a[2] << 8) | a[1]) + 1u; /* samples */
+            int bits, stereo, sgnd, autoinit;
+            unsigned ch, frame, bytes;
+            if (cmd & 0x08) break;               /* bit3 set = A/D input: skip */
+            bits     = (cmd < 0xC0) ? 16 : 8;    /* 0xBx=16-bit, 0xCx=8-bit */
+            autoinit = (cmd & 0x04) ? 1 : 0;
+            stereo   = (mode & 0x20) ? 1 : 0;
+            sgnd     = (mode & 0x10) ? 1 : 0;
+            ch       = (bits == 16) ? SB_DMA16 : SB_DMA8;
+            frame    = (unsigned)(bits / 8) * (stereo ? 2u : 1u);
+            bytes    = len * frame;              /* TUNE: length convention */
+            sb_start(bits, stereo, sgnd, ch, autoinit, bytes);
+        }
+        /* other commands: accepted and ignored. */
+        break;
+    }
+}
+
+static void dsp_write(BYTE b)
+{
+    if (dsp_argn > 0) {
+        dsp_args[dsp_argc++] = b;
+        if (dsp_argc >= dsp_argn) {
+            dsp_argn = 0;
+            dsp_execute(dsp_cmd, dsp_args);
+        }
+        return;
+    }
+    dsp_cmd  = b;
+    dsp_argc = 0;
+    dsp_argn = dsp_arg_count(b);
+    if (dsp_argn == 0) dsp_execute(b, dsp_args);
+}
+
+/* ------------------------------------------------------------------------- */
 
 VOID WINAPI sb_outb(WORD iport, BYTE data)
 {
+    if (InterlockedCompareExchange(&sb_cs_ready, 1, 1)) EnterCriticalSection(&sb_cs);
+
     switch (iport - SB_BASE) {
-    case 0x06: /* 0x226 DSP reset: 1 then 0 triggers the 0xAA ready byte */
+    case 0x04: /* 0x224 mixer address latch */
+        mixer_addr = data;
+        break;
+    case 0x05: /* 0x225 mixer data */
+        mixer_regs[mixer_addr] = data;
+        break;
+    case 0x06: /* 0x226 DSP reset: 1 then 0 readies the card and stops audio */
         if (data & 0x01) {
             sb_reset_pending = 1;
         } else if (sb_reset_pending) {
             sb_reset_pending = 0;
             sb_fifo_clear();
             sb_fifo_push(0xAA);
+            sb_stop();
+            sb_speaker = 1;
+            dsp_argc = dsp_argn = 0;
+            InterlockedExchange(&sb_irq8_pending, 0);
+            InterlockedExchange(&sb_irq16_pending, 0);
         }
         break;
     case 0x0C: /* 0x22C DSP write command/data */
-        if (data == 0xE1) { /* DSP version query */
-            sb_fifo_push(SB_DSP_MAJOR);
-            sb_fifo_push(SB_DSP_MINOR);
-        }
-        /* Other commands are accepted and ignored in the MVP. */
+        dsp_write(data);
         break;
     default:
         break;
     }
+
+    if (InterlockedCompareExchange(&sb_cs_ready, 1, 1)) LeaveCriticalSection(&sb_cs);
 }
 
 VOID WINAPI sb_inb(WORD iport, PBYTE data)
 {
     switch (iport - SB_BASE) {
+    case 0x05: /* 0x225 mixer data read */
+        switch (mixer_addr) {
+        case 0x80: *data = 0x02; break;                 /* IRQ select: IRQ5 */
+        case 0x81: *data = 0x22; break;                 /* DMA: DMA1 + DMA5 */
+        case 0x82: {                                    /* IRQ status */
+            BYTE s = 0;
+            if (sb_irq8_pending)  s |= 0x01;
+            if (sb_irq16_pending) s |= 0x02;
+            *data = s;
+            break;
+        }
+        default: *data = mixer_regs[mixer_addr]; break;
+        }
+        break;
     case 0x0A: /* 0x22A DSP read data */
         *data = sb_fifo_pop();
         break;
-    case 0x0C: /* 0x22C write-buffer status: bit7 set = busy. Always ready. */
+    case 0x0C: /* 0x22C write-buffer status: bit7 = busy. Always ready. */
         *data = 0x7F;
         break;
-    case 0x0E: /* 0x22E read-buffer status: bit7 set = data available */
+    case 0x0E: /* 0x22E read-buffer status (bit7 = data avail) + 8-bit IRQ ack */
+        InterlockedExchange(&sb_irq8_pending, 0);
         *data = sb_fifo_empty() ? (BYTE)0x7F : (BYTE)0xFF;
+        break;
+    case 0x0F: /* 0x22F 16-bit IRQ acknowledge */
+        InterlockedExchange(&sb_irq16_pending, 0);
+        *data = 0xFF;
         break;
     default:
         *data = 0xFF;
         break;
     }
+}
+
+/* ---- render thread: pull DMA, resample, mix (under sb_cs) ---------------- */
+
+static void sb_decode_frame(const BYTE *p, int16_t *l, int16_t *r)
+{
+    if (sb_bits == 16) {
+        int s0 = (int)(int16_t)(p[0] | (p[1] << 8));
+        if (!sb_signed) s0 = (int)((p[0] | (p[1] << 8))) - 32768;
+        if (sb_stereo) {
+            int s1 = (int)(int16_t)(p[2] | (p[3] << 8));
+            if (!sb_signed) s1 = (int)((p[2] | (p[3] << 8))) - 32768;
+            *l = (int16_t)s0; *r = (int16_t)s1;
+        } else {
+            *l = *r = (int16_t)s0;
+        }
+    } else { /* 8-bit */
+        int s0 = sb_signed ? (int)(signed char)p[0] : ((int)p[0] - 128);
+        s0 <<= 8;
+        if (sb_stereo) {
+            int s1 = sb_signed ? (int)(signed char)p[1] : ((int)p[1] - 128);
+            s1 <<= 8;
+            *l = (int16_t)s0; *r = (int16_t)s1;
+        } else {
+            *l = *r = (int16_t)s0;
+        }
+    }
+}
+
+/* Refill the decoded staging buffer from guest DMA. Returns frames produced;
+ * 0 on block end (single-cycle: stops) or guest underrun. */
+static unsigned sb_refill_stage(void)
+{
+    unsigned frame, want, got, frames, i;
+
+    if (!sb_play) return 0;
+
+    if (sb_bytes_left == 0) {           /* previous block fully consumed */
+        sb_post_irq();
+        if (sb_autoinit) {
+            sb_bytes_left = sb_block_bytes;
+        } else {
+            sb_play = 0;
+            return 0;
+        }
+    }
+
+    frame = (unsigned)(sb_bits / 8) * (sb_stereo ? 2u : 1u);
+    if (frame == 0) { sb_play = 0; return 0; }
+
+    want = SB_STAGE_RAW_BYTES;
+    if (want > sb_bytes_left) want = sb_bytes_left;
+    want -= want % frame;
+    if (want == 0) { sb_bytes_left = 0; return 0; }
+
+    got = VDDRequestDMA(sb_hvdd, sb_channel, sb_raw, want);
+    if (got > want) got = want;
+    got -= got % frame;
+    if (got == 0) return 0;             /* guest underrun: silence, retry */
+
+    sb_bytes_left -= got;
+    frames = got / frame;
+    for (i = 0; i < frames; i++) {
+        sb_decode_frame(sb_raw + i * frame, &sb_stage[2 * i], &sb_stage[2 * i + 1]);
+    }
+    sb_stage_head = frames;
+    sb_stage_pos  = 0;
+    return frames;
+}
+
+static int sb_next_frame(int *l, int *r)
+{
+    if (sb_stage_pos >= sb_stage_head) {
+        if (sb_refill_stage() == 0) return 0;
+    }
+    *l = sb_stage[2 * sb_stage_pos];
+    *r = sb_stage[2 * sb_stage_pos + 1];
+    sb_stage_pos++;
+    return 1;
+}
+
+void sb_mix(int16_t *buf, unsigned frames)
+{
+    unsigned step, i;
+
+    if (!InterlockedCompareExchange(&sb_cs_ready, 1, 1)) return;
+    EnterCriticalSection(&sb_cs);
+
+    if (!sb_play || sb_paused) { LeaveCriticalSection(&sb_cs); return; }
+
+    step = (sb_rate << 16) / AUDIO_SAMPLE_RATE;
+    if (step == 0) step = 1;
+
+    if (!sb_have_cur) {
+        if (!sb_next_frame(&sb_cur_l, &sb_cur_r)) { LeaveCriticalSection(&sb_cs); return; }
+        if (!sb_next_frame(&sb_nxt_l, &sb_nxt_r)) { sb_nxt_l = sb_cur_l; sb_nxt_r = sb_cur_r; }
+        sb_have_cur = 1;
+        sb_phase = 0;
+    }
+
+    for (i = 0; i < frames; i++) {
+        int f = (int)(sb_phase & 0xFFFFu);
+        /* 64-bit intermediate: (17-bit delta) * (16-bit frac) overflows int32. */
+        int l = sb_cur_l + (int)(((int64_t)(sb_nxt_l - sb_cur_l) * f) >> 16);
+        int r = sb_cur_r + (int)(((int64_t)(sb_nxt_r - sb_cur_r) * f) >> 16);
+
+        if (sb_speaker) {
+            int ml = (int)buf[2 * i]     + l;
+            int mr = (int)buf[2 * i + 1] + r;
+            buf[2 * i]     = (int16_t)(ml < -32768 ? -32768 : ml > 32767 ? 32767 : ml);
+            buf[2 * i + 1] = (int16_t)(mr < -32768 ? -32768 : mr > 32767 ? 32767 : mr);
+        }
+
+        sb_phase += step;
+        while (sb_phase >= 0x10000u) {
+            sb_phase -= 0x10000u;
+            sb_cur_l = sb_nxt_l; sb_cur_r = sb_nxt_r;
+            if (!sb_next_frame(&sb_nxt_l, &sb_nxt_r)) {
+                sb_nxt_l = sb_cur_l; sb_nxt_r = sb_cur_r;
+                if (!sb_play) { LeaveCriticalSection(&sb_cs); return; }
+                /* else: transient guest underrun - hold last sample. */
+            }
+        }
+    }
+
+    LeaveCriticalSection(&sb_cs);
 }

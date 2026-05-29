@@ -6,6 +6,7 @@
 #include "common.h"
 #include "audio_out.h"
 #include "opl_module.h"
+#include "sb_module.h"
 
 #include <dsound.h>
 #include <stdint.h>
@@ -45,6 +46,7 @@ static int write_chunk(DWORD offset)
     }
 
     opl_render(tmp, CHUNK_FRAMES);
+    sb_mix(tmp, CHUNK_FRAMES);   /* mix digital SB PCM on top of the FM block */
 
     CopyMemory(p1, (const char *)tmp, b1);
     if (p2 != NULL && b2 != 0) {
