@@ -10,8 +10,15 @@
 #include <dsound.h>
 #include <stdint.h>
 
-#define CHUNK_FRAMES 768u                         /* ~16 ms at 48 kHz */
-#define NUM_CHUNKS   6u                           /* ~96 ms total ring */
+/* Ring buffer = NUM_CHUNKS x CHUNK_FRAMES. The render thread refills one chunk
+ * at a time behind the play cursor, so the whole ring stays queued ahead of
+ * playback: a deeper ring tolerates longer render-thread scheduling gaps (NTVDM
+ * readily starves core 0) and removes the underruns behind the FM glitching, at
+ * the cost of that much output latency. Tune via NUM_CHUNKS; keep CHUNK_FRAMES
+ * modest since write_chunk() puts CHUNK_FRAMES*2 int16 on the stack and finer
+ * chunks refill more smoothly. */
+#define CHUNK_FRAMES 768u                         /* 16 ms/chunk @ 48 kHz */
+#define NUM_CHUNKS   24u                          /* ~384 ms ring (was 6 = ~96 ms, underran) */
 #define FRAME_BYTES  4u                           /* 16-bit stereo */
 #define CHUNK_BYTES  (CHUNK_FRAMES * FRAME_BYTES)
 #define BUF_BYTES    (CHUNK_BYTES * NUM_CHUNKS)
