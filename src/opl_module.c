@@ -101,12 +101,18 @@ void opl_render(int16_t *buf, unsigned frames)
         return;
     }
 
-    /* Drain all pending register writes. */
+    /* Drain pending register writes into Nuked's own timestamped write buffer.
+     * OPL3_WriteRegBuffered schedules each write OPL_WRITEBUF_DELAY (2) samples
+     * after the previous, and OPL3_GenerateStream applies them at those sample
+     * offsets as it renders. So a burst of writes is spread across the block at
+     * hardware-accurate spacing and takes effect mid-block, instead of
+     * OPL3_WriteReg collapsing the whole burst onto the block's first sample
+     * (the old block-granularity smear, worst on render-thread catch-up). */
     tail = __atomic_load_n(&opl_tail, __ATOMIC_RELAXED);
     head = __atomic_load_n(&opl_head, __ATOMIC_ACQUIRE);
     while (tail != head) {
         uint32_t packed = opl_queue[tail];
-        OPL3_WriteReg(&chip, (uint16_t)(packed >> 8), (uint8_t)(packed & 0xFF));
+        OPL3_WriteRegBuffered(&chip, (uint16_t)(packed >> 8), (uint8_t)(packed & 0xFF));
         tail = (tail + 1u) & OPL_QUEUE_MASK;
     }
     __atomic_store_n(&opl_tail, tail, __ATOMIC_RELEASE);
