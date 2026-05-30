@@ -43,6 +43,12 @@
 
 #define SB_STAGE_RAW_BYTES 2048u   /* per-pull DMA staging (whole frames) */
 
+/* DIAG(b46): when 1, ignore the guest buffer and feed a pure tone instead, to
+ * test whether the DirectSound PCM OUTPUT path (8-bit, odd rate, resampled,
+ * looping) is itself clean. A clean tone exonerates the output path (the
+ * garbage is then the guest data / our read); a garbled tone indicts it. */
+#define SB_TONE_TEST 1
+
 /* ---- detection FIFO (VDM thread only) ----------------------------------- */
 static BYTE     sb_fifo[SB_FIFO_SIZE];
 static unsigned sb_fifo_head, sb_fifo_tail;
@@ -613,9 +619,30 @@ void sb_mix(int16_t *buf, unsigned frames)
             want -= want % frame;
 
             if (want > 0) {
+#if SB_TONE_TEST
+                /* Feed a pure ~344 Hz (DOOM) / ~188 Hz (Skyroads) tone instead
+                 * of the guest, to hear the DS PCM output path in isolation.
+                 * 8-bit unsigned (DS native), centred on 0x80 - no XOR. */
+                {
+                    static const BYTE tone[32] = {
+                        128,151,174,195,213,228,239,246,248,246,239,228,
+                        213,195,174,151,128,105, 82, 61, 43, 28, 17, 10,
+                          8, 10, 17, 28, 43, 61, 82,105 };
+                    static unsigned ph;
+                    if (frame >= 2u) {
+                        for (k = 0; k + 1u < want; k += 2u) {
+                            BYTE s = tone[ph++ & 31u];
+                            sb_snapshot[k] = s; sb_snapshot[k + 1u] = s;
+                        }
+                    } else {
+                        for (k = 0; k < want; k++) sb_snapshot[k] = tone[ph++ & 31u];
+                    }
+                }
+#else
                 CopyMemory(sb_snapshot, sb_dma_ptr + sb_dma_pos, want);
                 if (sb_bits == 8 && sb_signed)
                     for (k = 0; k < want; k++) sb_snapshot[k] ^= 0x80u;
+#endif
                 sb_load_fp     = audio_pcm_play(sb_snapshot, want);
                 sb_dma_pos    += want;
                 sb_xfer_total += want;
