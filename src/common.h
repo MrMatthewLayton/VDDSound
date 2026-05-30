@@ -79,16 +79,43 @@ PBYTE WINAPI MGetVdmPointer(ULONG Address, ULONG Size, BOOL ProtectedMode);
 
 /* ---- DMA + IRQ (digital SB playback) ------------------------------------ */
 
+/* NTVDM's per-channel 8237 state (packed; matches the DDK VDD_DMA_INFO that
+ * VDDQueryDMA/VDDSetDMA exchange). 9 bytes: a WORD[16] over-reads it safely. */
+#pragma pack(push, 1)
+typedef struct _VDD_DMA_INFO {
+    WORD addr;    /* current address register (byte- or word-granular)      */
+    WORD count;   /* current count register (transfers - 1, counts down)    */
+    WORD page;    /* page register                                          */
+    BYTE status;  /* status (TC/DREQ bits)                                  */
+    BYTE mode;    /* mode register (bits 6-7 = mode, bit 4 = auto-init)     */
+    BYTE mask;    /* mask register bit for this channel                     */
+} VDD_DMA_INFO, *PVDD_DMA_INFO;
+#pragma pack(pop)
+
+/* VDDSetDMA field-select flags. */
+#define VDD_DMA_ADDR    0x01u
+#define VDD_DMA_COUNT   0x02u
+#define VDD_DMA_PAGE    0x04u
+#define VDD_DMA_STATUS  0x08u
+
 /* Transfer up to Length bytes from the guest's DMA buffer on channel iChannel
  * into Buffer, advancing the virtual 8237 controller. Returns the number of
- * bytes actually transferred (0 when the guest side has nothing queued). */
+ * bytes actually transferred. NOTE: returns 0 on this NTVDM (it only services
+ * Single-mode unmasked channels) - we drive the controller with VDDSetDMA
+ * instead, the way VDMSound does. */
 ULONG WINAPI VDDRequestDMA(HANDLE hVdd, ULONG iChannel, PVOID Buffer,
                            ULONG Length);
 
 /* Report NTVDM's view of a DMA channel (addr/count/page/mode/mask) into a
- * VDD_DMA_INFO struct; non-consuming. Used to diagnose why VDDRequestDMA
- * returns nothing. pDmaInfo is a caller buffer (>= sizeof(VDD_DMA_INFO)). */
+ * VDD_DMA_INFO struct; non-consuming. */
 VOID WINAPI VDDQueryDMA(HANDLE hVdd, ULONG iChannel, PVOID pDmaInfo);
+
+/* Write selected fields (fDMA = VDD_DMA_* mask) of NTVDM's emulated 8237 for
+ * iChannel from pDmaInfo. This is how a VDD advances the controller's current
+ * address/count so a guest that polls the DMA ports (DOOM/DMX) sees the play
+ * cursor move. The blessed approach (VDMSound's), since VDDRequestDMA is inert
+ * here. */
+BOOL WINAPI VDDSetDMA(HANDLE hVdd, ULONG iChannel, ULONG fDMA, PVOID pDmaInfo);
 
 /* Post a hardware IRQ into the guest's 8259(s). ica = controller (0 = master,
  * lines 0-7; 1 = slave, lines 8-15), line = IRQ line on that controller, count

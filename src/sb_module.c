@@ -80,6 +80,9 @@ static const BYTE *sb_dma_ptr;     /* host pointer to the guest DMA buffer */
 static unsigned    sb_dma_len;     /* buffer length in bytes */
 static unsigned    sb_dma_pos;     /* play cursor within the buffer */
 static unsigned    sb_irq_accum;   /* bytes fed since the last block-completion IRQ */
+static unsigned    sb_base_addr;   /* 8237 base address register at transfer start */
+static unsigned    sb_base_count;  /* 8237 base count (transfers-1) at transfer start */
+static unsigned    sb_base_page;   /* 8237 page register at transfer start */
 
 /* ---- IRQ flags (atomic; render sets, VDM acks) -------------------------- */
 static volatile LONG sb_irq8_pending;
@@ -212,6 +215,12 @@ static void sb_start(int bits, int stereo, int sgnd, unsigned channel,
         logger_note_kv("sb: q addr", (unsigned long)info[0]);
         logger_note_kv("sb: q count", (unsigned long)info[1]);
         logger_note_kv("sb: q page", (unsigned long)info[2]);
+        /* Latch the 8237 base regs; we advance current addr/count from these
+         * each tick via VDDSetDMA so a polling guest (DOOM/DMX) tracks the play
+         * cursor. [b42-setdma] */
+        sb_base_addr  = info[0];
+        sb_base_count = info[1];
+        sb_base_page  = info[2];
         /* VDD_DMA_INFO {addr, count, page, ...}; phys = (page<<16)|addr. 8-bit
          * DMA is byte-granular; 16-bit DMA (ch >= 4) is word-granular. TUNE. */
         if (sb_channel >= 4u) {
@@ -642,22 +651,33 @@ void sb_mix(int16_t *buf, unsigned frames)
                 sb_dma_pos        += fed;
                 sb_diag_fed_total += fed;
 
-                /* Drive NTVDM's 8237 so its DMA count advances with playback.
-                 * b39 showed the count frozen at its initial value (we never
-                 * call VDDRequestDMA); DOOM's library polls the count to track
-                 * position, so a frozen count desyncs its mixer -> chk-a-chk-a.
-                 * Advance it by what we consumed (discard the copy; the audio
-                 * still comes from MGetVdmPointer). Auto-init only, so the
-                 * single-cycle path (Skyroads, plays correct sounds) is left
-                 * alone. Return value logged - a prior attempt returned 0, so we
-                 * confirm whether it transfers this time. [b40-drivedma] */
-                if (fed > 0 && sb_autoinit) {
-                    ULONG req = (fed > sizeof(sb_raw)) ? (ULONG)sizeof(sb_raw)
-                                                       : (ULONG)fed;
-                    ULONG got = VDDRequestDMA(sb_hvdd, sb_channel, sb_raw, req);
-                    if (sb_diag_req < 6) {
-                        logger_note_kv("sb: VDDRequestDMA asked", (unsigned long)req);
-                        logger_note_kv("sb: VDDRequestDMA got",   (unsigned long)got);
+                /* Advance NTVDM's emulated 8237 current addr/count so a guest
+                 * that POLLS the DMA controller sees the play cursor move. DOOM/
+                 * DMX reads ports 0x02/0x03 (current address) each interrupt to
+                 * pick which block to mix next; b39 proved the count was frozen
+                 * (VDDRequestDMA is inert here, b40: got=0), so DMX re-mixed one
+                 * block forever = chk-a-chk-a. We drive the controller directly
+                 * with VDDSetDMA, the way VDMSound does. The 8237 counts DOWN in
+                 * transfers (bytes for 8-bit ch<4, words for ch>=4); sb_dma_pos
+                 * is our byte cursor and wraps the ring on auto-init, which
+                 * reloads addr/count to base (the correct auto-init behaviour).
+                 * [b42-setdma] */
+                {
+                    VDD_DMA_INFO di;
+                    unsigned xfers = (sb_channel >= 4u) ? (sb_dma_pos >> 1)
+                                                        : sb_dma_pos;
+                    BOOL ok;
+                    di.addr   = (WORD)(sb_base_addr + xfers);
+                    di.count  = (WORD)(sb_base_count - xfers);
+                    di.page   = (WORD)sb_base_page;
+                    di.status = 0;
+                    di.mode   = 0;
+                    di.mask   = 0;
+                    ok = VDDSetDMA(sb_hvdd, sb_channel,
+                                   VDD_DMA_ADDR | VDD_DMA_COUNT, &di);
+                    if (sb_diag_req < 4) {
+                        logger_note_kv("sb: VDDSetDMA ok",    (unsigned long)ok);
+                        logger_note_kv("sb: VDDSetDMA count", (unsigned long)di.count);
                         sb_diag_req++;
                     }
                 }
