@@ -48,7 +48,6 @@ static int write_chunk(DWORD offset)
     }
 
     opl_render(tmp, CHUNK_FRAMES);
-    sb_mix(tmp, CHUNK_FRAMES);   /* mix digital SB PCM on top of the FM block */
 
     CopyMemory(p1, (const char *)tmp, b1);
     if (p2 != NULL && b2 != 0) {
@@ -83,6 +82,8 @@ static DWORD WINAPI render_proc(LPVOID arg)
         /* Having to fill most of the ring in one wake means the thread was
          * starved that long: peak near NUM_CHUNKS == underrun (audible crackle).
          * Logged every ~256 chunks (~4s) so we can confirm the cause. */
+        sb_mix(NULL, 0);   /* PCM streaming feeder: top up the lead each ~1ms */
+
         if (burst > peak) peak = burst;
         if ((acc += burst) >= 256u) {
             logger_note_kv("audio: peak chunks/wake (max=NUM_CHUNKS)",
@@ -129,22 +130,23 @@ static int create_buffer(void)
     return 0;
 }
 
-/* ---- one-shot PCM secondary buffer (DS does the SRC + mixing) ------------ */
+/* ---- streaming PCM via a looping DirectSound buffer (DS does SRC + mixing) - */
 static LPDIRECTSOUNDBUFFER pcm_buf;
 static CRITICAL_SECTION    pcm_lock;
 static volatile LONG       pcm_lock_ready;
-static int                 pcm_active;
+static unsigned            pcm_bytes;   /* ring size */
+static DWORD               pcm_write;   /* our write cursor */
+static int                 pcm_on;
 
-int audio_pcm_play(const void *data, unsigned bytes, unsigned rate,
-                   int bits, int channels)
+int audio_pcm_open(unsigned rate, int bits, int channels)
 {
     WAVEFORMATEX wfx;
     DSBUFFERDESC desc;
     void *p1 = NULL, *p2 = NULL;
     DWORD b1 = 0, b2 = 0;
-    int rc = 1;
+    unsigned sz, align = (unsigned)(channels * bits / 8);
 
-    if (ds == NULL || data == NULL || bytes < 4u) return 1;
+    if (ds == NULL || align == 0) return 1;
     if (!InterlockedCompareExchange(&pcm_lock_ready, 1, 1)) return 1;
 
     EnterCriticalSection(&pcm_lock);
@@ -153,50 +155,86 @@ int audio_pcm_play(const void *data, unsigned bytes, unsigned rate,
         pcm_buf->lpVtbl->Release(pcm_buf);
         pcm_buf = NULL;
     }
+    sz = (rate * align) / 8u;            /* ~125 ms ring */
+    if (sz < 4096u) sz = 4096u;
+    sz -= sz % align;
+
     ZeroMemory(&wfx, sizeof(wfx));
     wfx.wFormatTag      = WAVE_FORMAT_PCM;
     wfx.nChannels       = (WORD)channels;
     wfx.nSamplesPerSec  = rate;
     wfx.wBitsPerSample  = (WORD)bits;
-    wfx.nBlockAlign     = (WORD)(channels * bits / 8);
-    wfx.nAvgBytesPerSec = rate * wfx.nBlockAlign;
+    wfx.nBlockAlign     = (WORD)align;
+    wfx.nAvgBytesPerSec = rate * align;
 
     ZeroMemory(&desc, sizeof(desc));
     desc.dwSize        = sizeof(desc);
     desc.dwFlags       = DSBCAPS_GLOBALFOCUS | DSBCAPS_GETCURRENTPOSITION2;
-    desc.dwBufferBytes = bytes;
+    desc.dwBufferBytes = sz;
     desc.lpwfxFormat   = &wfx;
 
-    if (SUCCEEDED(ds->lpVtbl->CreateSoundBuffer(ds, &desc, &pcm_buf, NULL))) {
-        if (SUCCEEDED(pcm_buf->lpVtbl->Lock(pcm_buf, 0, bytes, &p1, &b1, &p2, &b2, 0))) {
-            CopyMemory(p1, data, b1);
-            if (p2 != NULL && b2 != 0) CopyMemory(p2, (const char *)data + b1, b2);
-            pcm_buf->lpVtbl->Unlock(pcm_buf, p1, b1, p2, b2);
-        }
-        pcm_buf->lpVtbl->Play(pcm_buf, 0, 0, 0);   /* one-shot, no loop */
-        pcm_active = 1;
-        rc = 0;
-    } else {
+    if (FAILED(ds->lpVtbl->CreateSoundBuffer(ds, &desc, &pcm_buf, NULL))) {
         pcm_buf = NULL;
+        LeaveCriticalSection(&pcm_lock);
+        return 1;
     }
+    if (SUCCEEDED(pcm_buf->lpVtbl->Lock(pcm_buf, 0, sz, &p1, &b1, &p2, &b2, 0))) {
+        FillMemory(p1, b1, (bits == 8) ? 0x80 : 0x00);
+        if (p2 != NULL && b2 != 0) FillMemory(p2, b2, (bits == 8) ? 0x80 : 0x00);
+        pcm_buf->lpVtbl->Unlock(pcm_buf, p1, b1, p2, b2);
+    }
+    pcm_bytes = sz;
+    pcm_write = 0;
+    pcm_on    = 1;
+    pcm_buf->lpVtbl->SetCurrentPosition(pcm_buf, 0);
+    pcm_buf->lpVtbl->Play(pcm_buf, 0, 0, DSBPLAY_LOOPING);
     LeaveCriticalSection(&pcm_lock);
-    return rc;
+    return 0;
 }
 
-int audio_pcm_done(void)
+unsigned audio_pcm_lead(void)
 {
-    DWORD st;
-    int done = 0;
+    DWORD play, write;
+    unsigned lead = 0;
     if (!InterlockedCompareExchange(&pcm_lock_ready, 1, 1)) return 0;
     EnterCriticalSection(&pcm_lock);
-    if (pcm_active && pcm_buf != NULL &&
-        SUCCEEDED(pcm_buf->lpVtbl->GetStatus(pcm_buf, &st)) &&
-        !(st & DSBSTATUS_PLAYING)) {
-        pcm_active = 0;
-        done = 1;
+    if (pcm_on && pcm_buf != NULL &&
+        SUCCEEDED(pcm_buf->lpVtbl->GetCurrentPosition(pcm_buf, &play, &write)))
+        lead = (pcm_write + pcm_bytes - play) % pcm_bytes;
+    LeaveCriticalSection(&pcm_lock);
+    return lead;
+}
+
+unsigned audio_pcm_feed(const void *data, unsigned n)
+{
+    void *p1 = NULL, *p2 = NULL;
+    DWORD b1 = 0, b2 = 0;
+    unsigned wrote = 0;
+    if (!InterlockedCompareExchange(&pcm_lock_ready, 1, 1)) return 0;
+    EnterCriticalSection(&pcm_lock);
+    if (pcm_on && pcm_buf != NULL && n > 0 &&
+        SUCCEEDED(pcm_buf->lpVtbl->Lock(pcm_buf, pcm_write, n, &p1, &b1, &p2, &b2, 0))) {
+        CopyMemory(p1, data, b1);
+        if (p2 != NULL && b2 != 0) CopyMemory(p2, (const char *)data + b1, b2);
+        pcm_buf->lpVtbl->Unlock(pcm_buf, p1, b1, p2, b2);
+        pcm_write = (pcm_write + n) % pcm_bytes;
+        wrote = n;
     }
     LeaveCriticalSection(&pcm_lock);
-    return done;
+    return wrote;
+}
+
+void audio_pcm_close(void)
+{
+    if (!InterlockedCompareExchange(&pcm_lock_ready, 1, 1)) return;
+    EnterCriticalSection(&pcm_lock);
+    if (pcm_buf != NULL) {
+        pcm_buf->lpVtbl->Stop(pcm_buf);
+        pcm_buf->lpVtbl->Release(pcm_buf);
+        pcm_buf = NULL;
+    }
+    pcm_on = 0;
+    LeaveCriticalSection(&pcm_lock);
 }
 
 int audio_init(void)

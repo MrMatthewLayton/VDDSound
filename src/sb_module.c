@@ -203,21 +203,10 @@ static void sb_start(int bits, int stereo, int sgnd, unsigned channel,
         if (cnt > sizeof(sb_snapshot)) cnt = sizeof(sb_snapshot);   /* cap */
         sb_dma_len = cnt;
         sb_dma_pos = 0;
-        {
-            /* Snapshot the buffer NOW, on the VDM thread, while it is filled and
-             * stable. The render thread plays from this private copy, so the
-             * guest can rewrite / re-trigger the same buffer (Skyroads fires it
-             * ~0.275s apart) without tearing the audio we read ahead of the play
-             * cursor. Also sidesteps any MGetVdmPointer staleness. */
-            const BYTE *g = (cnt > 1u)
-                            ? (const BYTE *)MGetVdmPointer(lin, cnt, FALSE) : NULL;
-            if (g) {
-                CopyMemory(sb_snapshot, g, cnt);
-                sb_dma_ptr = sb_snapshot;
-            } else {
-                sb_dma_ptr = NULL;
-            }
-        }
+        /* LIVE pointer: read the guest buffer as it streams (do NOT snapshot -
+         * the guest fills it just-in-time; a command-time snapshot is empty). */
+        sb_dma_ptr = (cnt > 1u) ? (const BYTE *)MGetVdmPointer(lin, cnt, FALSE)
+                                : NULL;
         logger_note_kv("sb: dma lin", (unsigned long)lin);
         logger_note_kv("sb: dma len", (unsigned long)cnt);
         logger_note_kv("sb: dma ptr ok", (unsigned long)(sb_dma_ptr != NULL));
@@ -229,26 +218,9 @@ static void sb_start(int bits, int stereo, int sgnd, unsigned channel,
     if (!sb_dma_ptr) {
         sb_play = 0;
         logger_note("sb: no DMA pointer - not playing");
-    } else {
-        if (sb_dma_len >= 544u) {   /* DIAG(b33): raw waveform window @ offset 512 */
-            unsigned k;
-            for (k = 0; k < 8u; k++) {
-                unsigned o = 512u + k * 4u;
-                logger_note_kv("sb: wav",
-                    (unsigned long)(sb_snapshot[o] | (sb_snapshot[o+1] << 8)
-                    | ((unsigned long)sb_snapshot[o+2] << 16)
-                    | ((unsigned long)sb_snapshot[o+3] << 24)));
-            }
-        }
-        /* Hand the PCM to DirectSound at its native format/rate - DS does the
-         * SRC + mixing. DS 8-bit is unsigned, so flip signed snapshots in place;
-         * 16-bit is signed and passes through. */
-        if (sb_bits == 8 && sb_signed) {
-            unsigned i;
-            for (i = 0; i < sb_dma_len; i++) sb_snapshot[i] ^= 0x80u;
-        }
-        audio_pcm_play(sb_snapshot, sb_dma_len, sb_rate, sb_bits,
-                       sb_stereo ? 2 : 1);
+    } else if (audio_pcm_open(sb_rate, sb_bits, sb_stereo ? 2 : 1) != 0) {
+        sb_play = 0;
+        logger_note("sb: audio_pcm_open failed");
     }
 }
 
@@ -529,16 +501,33 @@ void sb_mix(int16_t *buf, unsigned frames)
     if (!InterlockedCompareExchange(&sb_cs_ready, 1, 1)) return;
     EnterCriticalSection(&sb_cs);
 
-    /* PCM plays through a dedicated DirectSound buffer (DS does SRC + mixing);
-     * here we only watch it finish, to time the SB completion IRQ. The old
-     * in-driver resampler below is now unreachable (kept to avoid churn). */
-    if (sb_play && !sb_paused && audio_pcm_done()) {
-        sb_post_irq();
-        if (sb_autoinit)
-            audio_pcm_play(sb_snapshot, sb_dma_len, sb_rate, sb_bits,
-                           sb_stereo ? 2 : 1);
-        else
-            sb_play = 0;
+    /* Stream guest PCM to DirectSound LIVE: hold a ~20ms lead by reading the
+     * guest buffer just behind the play cursor (like the hardware DMA), 8-bit
+     * signed->unsigned for DS. The old in-driver resampler below is unreachable
+     * (kept so its helpers still compile). */
+    if (sb_play && !sb_paused && sb_dma_ptr) {
+        unsigned frame  = (unsigned)(sb_bits / 8) * (sb_stereo ? 2u : 1u);
+        unsigned target = frame ? (sb_rate * frame) / 50u : 0u;   /* ~20 ms */
+        unsigned lead   = audio_pcm_lead();
+        if (frame && lead < target) {
+            unsigned want  = target - lead;
+            unsigned avail = sb_dma_len - sb_dma_pos;
+            unsigned k;
+            if (want > avail)               want = avail;
+            if (want > sizeof(sb_snapshot)) want = sizeof(sb_snapshot);
+            want -= want % frame;
+            if (want > 0) {
+                CopyMemory(sb_snapshot, sb_dma_ptr + sb_dma_pos, want);
+                if (sb_bits == 8 && sb_signed)
+                    for (k = 0; k < want; k++) sb_snapshot[k] ^= 0x80u;
+                sb_dma_pos += audio_pcm_feed(sb_snapshot, want);
+            }
+        }
+        if (sb_dma_pos >= sb_dma_len) {      /* whole transfer fed */
+            sb_post_irq();
+            if (sb_autoinit) sb_dma_pos = 0;            /* re-read refilled guest */
+            else { sb_play = 0; audio_pcm_close(); }
+        }
     }
     LeaveCriticalSection(&sb_cs);
     return;
