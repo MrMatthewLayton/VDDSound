@@ -7,8 +7,10 @@
 #include "audio_out.h"
 #include "opl_module.h"
 #include "sb_module.h"
+#include "logger.h"
 
 #include <dsound.h>
+#include <mmsystem.h>   /* timeBeginPeriod/timeEndPeriod (winmm) */
 #include <stdint.h>
 
 /* Ring buffer = NUM_CHUNKS x CHUNK_FRAMES. The render thread refills one chunk
@@ -59,10 +61,12 @@ static int write_chunk(DWORD offset)
 static DWORD WINAPI render_proc(LPVOID arg)
 {
     DWORD wr = 0;
+    unsigned acc = 0, peak = 0;   /* fill-health meter */
     (void)arg;
 
     while (InterlockedCompareExchange(&running, 1, 1)) {
         DWORD play = 0, write = 0, avail;
+        unsigned burst = 0;
         if (FAILED(dsb->lpVtbl->GetCurrentPosition(dsb, &play, &write))) {
             Sleep(5);
             continue;
@@ -74,6 +78,17 @@ static DWORD WINAPI render_proc(LPVOID arg)
             }
             wr = (wr + CHUNK_BYTES) % BUF_BYTES;
             avail -= CHUNK_BYTES;
+            burst++;
+        }
+        /* Having to fill most of the ring in one wake means the thread was
+         * starved that long: peak near NUM_CHUNKS == underrun (audible crackle).
+         * Logged every ~256 chunks (~4s) so we can confirm the cause. */
+        if (burst > peak) peak = burst;
+        if ((acc += burst) >= 256u) {
+            logger_note_kv("audio: peak chunks/wake (max=NUM_CHUNKS)",
+                           (unsigned long)peak);
+            acc = 0;
+            peak = 0;
         }
         Sleep(1);
     }
@@ -134,10 +149,12 @@ int audio_init(void)
 
     dsb->lpVtbl->Play(dsb, 0, 0, DSBPLAY_LOOPING);
 
+    timeBeginPeriod(1);   /* ~1ms scheduler tick for the render loop's Sleep(1) */
     running = 1;
     render_thread = CreateThread(NULL, 0, render_proc, NULL, 0, &tid);
     if (render_thread == NULL) {
         running = 0;
+        timeEndPeriod(1);
         dsb->lpVtbl->Stop(dsb);
         dsb->lpVtbl->Release(dsb);
         ds->lpVtbl->Release(ds);
@@ -145,7 +162,7 @@ int audio_init(void)
         ds = NULL;
         return 1;
     }
-    SetThreadPriority(render_thread, THREAD_PRIORITY_ABOVE_NORMAL);
+    SetThreadPriority(render_thread, THREAD_PRIORITY_TIME_CRITICAL);
     return 0;
 }
 
@@ -156,6 +173,7 @@ void audio_shutdown(void)
         WaitForSingleObject(render_thread, 2000);
         CloseHandle(render_thread);
         render_thread = NULL;
+        timeEndPeriod(1);
     }
     if (dsb != NULL) {
         dsb->lpVtbl->Stop(dsb);

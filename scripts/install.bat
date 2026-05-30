@@ -33,6 +33,8 @@ echo     ok - NTVDM not running.
 echo [2/5] Checking source DLL...
 if not exist "%SRC%" (echo     ERROR: not found next to this script: %SRC%& echo.& pause& exit /b 1)
 echo     ok - %SRC%
+echo     source build tag (what the shared folder is handing us):
+findstr /C:"vddsound build [" "%SRC%"
 
 echo [3/5] Clearing old trace log...
 if not exist "C:\vddsound" mkdir "C:\vddsound"
@@ -56,10 +58,12 @@ echo     ok - VDD = %DEST%
 echo.
 echo     Deployed OK:
 for %%F in ("%DEST%") do echo       %%~tF   %%~zF bytes
+echo     DEPLOYED build tag at %DEST% (this is what will load - confirm it is latest):
+findstr /C:"vddsound build [" "%DEST%"
 echo.
 echo  Registration takes effect on the next NTVDM launch. Just run your DOS
 echo  program, then open %LOG%.
-echo  The FIRST log line shows the build tag, e.g. [b5-userhook].
+echo  The FIRST log line must show the SAME tag printed just above.
 echo  If it shows an older tag or none (DLL not loading), reboot once and retry.
 echo.
 pause

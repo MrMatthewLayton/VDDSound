@@ -86,6 +86,7 @@ static volatile LONG sb_irq16_pending;
 
 /* ---- resampler + decode staging (render thread only) -------------------- */
 static BYTE     sb_raw[SB_STAGE_RAW_BYTES];
+static BYTE     sb_snapshot[131072];   /* private copy of the guest DMA buffer */
 static int16_t  sb_stage[SB_STAGE_RAW_BYTES * 2]; /* decoded stereo frames */
 static unsigned sb_stage_head, sb_stage_pos;
 static int      sb_have_cur;
@@ -139,6 +140,22 @@ static void sb_post_irq(void)
     call_ica_hw_interrupt(0, SB_IRQ, 1);
 }
 
+/* SB 8-bit PCM signedness is not conveyed by the classic DMA commands and games
+ * disagree (Skyroads sends signed data via the spec-unsigned 0x14). Detect it
+ * from the buffer: unsigned silence is 0x80, signed silence is 0x00 - whichever
+ * dominates a sample of the data wins, defaulting to unsigned (the SB spec)
+ * when neither is clearly present. */
+static int sb_detect_signed(const BYTE *p, unsigned len)
+{
+    unsigned i, n = (len < 2048u) ? len : 2048u, zeros = 0, mids = 0;
+    if (!p) return 0;
+    for (i = 0; i < n; i++) {
+        if (p[i] == 0x00)      zeros++;
+        else if (p[i] == 0x80) mids++;
+    }
+    return (zeros > mids) ? 1 : 0;
+}
+
 static void sb_start(int bits, int stereo, int sgnd, unsigned channel,
                      int autoinit, unsigned block_bytes)
 {
@@ -160,6 +177,7 @@ static void sb_start(int bits, int stereo, int sgnd, unsigned channel,
     logger_note_kv("sb: dma start, bytes", (unsigned long)sb_block_bytes);
     logger_note_kv("sb: start bits", (unsigned long)sb_bits);
     logger_note_kv("sb: start stereo", (unsigned long)sb_stereo);
+    logger_note_kv("sb: start signed", (unsigned long)sb_signed);
     logger_note_kv("sb: start chan", (unsigned long)sb_channel);
     logger_note_kv("sb: start autoinit", (unsigned long)sb_autoinit);
     /* Map the guest DMA buffer directly. VDDRequestDMA returns 0 on this NTVDM,
@@ -170,6 +188,9 @@ static void sb_start(int bits, int stereo, int sgnd, unsigned channel,
         ULONG lin, cnt;
         ZeroMemory(info, sizeof(info));
         VDDQueryDMA(sb_hvdd, sb_channel, info);
+        logger_note_kv("sb: q addr", (unsigned long)info[0]);
+        logger_note_kv("sb: q count", (unsigned long)info[1]);
+        logger_note_kv("sb: q page", (unsigned long)info[2]);
         /* VDD_DMA_INFO {addr, count, page, ...}; phys = (page<<16)|addr. 8-bit
          * DMA is byte-granular; 16-bit DMA (ch >= 4) is word-granular. TUNE. */
         if (sb_channel >= 4u) {
@@ -179,13 +200,31 @@ static void sb_start(int bits, int stereo, int sgnd, unsigned channel,
             lin = ((ULONG)(info[2] & 0xFFu) << 16) | info[0];
             cnt = (ULONG)info[1] + 1u;
         }
+        if (cnt > sizeof(sb_snapshot)) cnt = sizeof(sb_snapshot);   /* cap */
         sb_dma_len = cnt;
         sb_dma_pos = 0;
-        sb_dma_ptr = (cnt > 1u && cnt < 0x1000000u)
-                     ? (const BYTE *)MGetVdmPointer(lin, cnt, FALSE) : NULL;
+        {
+            /* Snapshot the buffer NOW, on the VDM thread, while it is filled and
+             * stable. The render thread plays from this private copy, so the
+             * guest can rewrite / re-trigger the same buffer (Skyroads fires it
+             * ~0.275s apart) without tearing the audio we read ahead of the play
+             * cursor. Also sidesteps any MGetVdmPointer staleness. */
+            const BYTE *g = (cnt > 1u)
+                            ? (const BYTE *)MGetVdmPointer(lin, cnt, FALSE) : NULL;
+            if (g) {
+                CopyMemory(sb_snapshot, g, cnt);
+                sb_dma_ptr = sb_snapshot;
+            } else {
+                sb_dma_ptr = NULL;
+            }
+        }
         logger_note_kv("sb: dma lin", (unsigned long)lin);
         logger_note_kv("sb: dma len", (unsigned long)cnt);
         logger_note_kv("sb: dma ptr ok", (unsigned long)(sb_dma_ptr != NULL));
+    }
+    if (sb_bits == 8 && sb_dma_ptr) {   /* content-detect signed vs unsigned */
+        sb_signed = sb_detect_signed(sb_dma_ptr, sb_dma_len);
+        logger_note_kv("sb: detected signed", (unsigned long)sb_signed);
     }
     if (!sb_dma_ptr) {
         sb_play = 0;
@@ -398,6 +437,8 @@ static unsigned sb_refill_stage(void)
     if (!sb_play || !sb_dma_ptr) return 0;
 
     if (sb_dma_pos >= sb_dma_len) {      /* block fully played */
+        if (!sb_diag_pull_logged)        /* DIAG(b24): never saw any data */
+            logger_note("sb: WHOLE TRANSFER READ AS ZERO (bad addr / unfilled buffer)");
         sb_post_irq();
         if (sb_autoinit) {
             sb_dma_pos = 0;             /* replay; the guest keeps refilling it */
@@ -417,17 +458,16 @@ static unsigned sb_refill_stage(void)
     if (want == 0) { sb_dma_pos = sb_dma_len; return 0; }
 
     CopyMemory(sb_raw, sb_dma_ptr + sb_dma_pos, want);
-    if (!sb_diag_pull_logged && want >= 8) {   /* DIAG: confirm real PCM */
-        sb_diag_pull_logged = 1;
-        logger_note_kv("sb: read pos", (unsigned long)sb_dma_pos);
-        logger_note_kv("sb: read 0-3",
-                       (unsigned long)(sb_raw[0] | (sb_raw[1] << 8)
-                       | ((unsigned long)sb_raw[2] << 16)
-                       | ((unsigned long)sb_raw[3] << 24)));
-        logger_note_kv("sb: read 4-7",
-                       (unsigned long)(sb_raw[4] | (sb_raw[5] << 8)
-                       | ((unsigned long)sb_raw[6] << 16)
-                       | ((unsigned long)sb_raw[7] << 24)));
+    if (!sb_diag_pull_logged) {   /* DIAG(b24): scan this read for ANY non-zero PCM */
+        unsigned z;
+        for (z = 0; z < want; z++) {
+            if (sb_raw[z] != 0) {
+                sb_diag_pull_logged = 1;
+                logger_note_kv("sb: DATA found at bufpos",
+                               (unsigned long)(sb_dma_pos + z));
+                break;
+            }
+        }
     }
     sb_dma_pos += want;
 

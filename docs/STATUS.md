@@ -2,7 +2,7 @@
 
 **This is the single source of truth for the current state.** `docs/ARCHITECTURE.md` describes the design/internals; the root `README.md` is the front page. Where they disagree with reality, **this file wins.**
 
-Last build tag: **`[b22-dmadirect]`**. Target: Windows XP SP3 32-bit NTVDM. Built on macOS with Homebrew MinGW-w64 i686, CRT-free, no XP-incompatible deps.
+Last build tag: **`[b30-pcm8]`**. Target: Windows XP SP3 32-bit NTVDM. Built on macOS with Homebrew MinGW-w64 i686, CRT-free, no XP-incompatible deps.
 
 ---
 
@@ -11,7 +11,7 @@ Last build tag: **`[b22-dmadirect]`**. Target: Windows XP SP3 32-bit NTVDM. Buil
 A statically-registered NTVDM Virtual Device Driver (`vddsound.dll`) that takes over the legacy sound ports and routes DOS audio to the host:
 - **MIDI** (MPU-401, `0x330/0x331`) → `midiOutShortMsg`/`midiOutLongMsg` (winmm).
 - **FM** (OPL2/3, `0x388-0x38B`) → **Nuked OPL3** software synth → **DirectSound**.
-- **SB DSP** (`0x220-0x22F`) → detection (reset→`0xAA`, version `0xE1`→`04 05`) **+ digital DMA playback** (`[b22-dmadirect]`): DSP command FSM → read guest PCM directly from memory (`VDDQueryDMA` + `MGetVdmPointer`, since `VDDRequestDMA` returns 0 on this NTVDM) → resample → mix into the FM/DirectSound buffer → IRQ5 via `call_ica_hw_interrupt`. **8-bit plays on the VM; 16-bit silent; both glitchy.**
+- **SB DSP** (`0x220-0x22F`) → detection (reset→`0xAA`, version `0xE1`→`04 05`) **+ digital DMA playback** (`[b22-dmadirect]`): DSP command FSM → read guest PCM directly from memory (`VDDQueryDMA` + `MGetVdmPointer`, since `VDDRequestDMA` returns 0 on this NTVDM) → snapshot buffer → resample → mix into the FM/DirectSound buffer → IRQ5 via `call_ica_hw_interrupt`. **8-bit plays the correct sounds on the VM (mild residual resampler crackle); 16-bit not yet.**
 - **Forensic logger** with guest CS:IP, off by default (set `VDDSOUND_TRACE=1`).
 
 ## What WORKS (verified on real XP SP3)
@@ -19,22 +19,25 @@ A statically-registered NTVDM Virtual Device Driver (`vddsound.dll`) that takes 
 - Loads into every NTVDM via the registry `VDD` list; `DllMain` runs; `VDDInstallUserHook` fires.
 - **Owns all three port ranges** (SB+MPU+OPL) — handlers fire for `0x220`/`0x330`/`0x388` (proven with DOS `debug`).
 - MIDI bytes reach winmm; FM register writes reach Nuked OPL3 → DirectSound; CS:IP capture works.
-- **8-bit SB digital PCM plays** (`[b22-dmadirect]`): the DSP FSM + direct guest-memory DMA read produce audible output. (Glitchy; 16-bit not yet.)
+- **8-bit SB digital PCM plays the correct sounds** (`[b30-pcm8]`, Skyroads SFX): DSP FSM + direct guest-memory DMA read + per-transfer buffer snapshot + signedness auto-detect. Residual mild crackle = our crude linear resampler imaging the low-rate sources (6024/8000 Hz). 16-bit not yet.
 - CPU-affinity pin to core 0 (in DllMain).
 
 ## What's BROKEN / unsolved
 1. **Tempo/time distortion (the big one).** DOS audio plays time-distorted ("stretched cassette", in-tune, drifting). **This is NTVDM's emulated timebase, not our code** — it hits native NTVDM, VDMSound, and us identically. Root cause: NTVDM idle-detection + PIT/BIOS-tick inaccuracy. **Nothing fixed it:** affinity, BIOS SpeedStep off, PIF Idle-Sensitivity=Low, Compatible-Timer toggle, full-screen — all no effect. Overriding the BIOS tick (`0040:006C`) from a host thread made it **worse** (fights NTVDM's IRQ0). This is the genuine NTVDM floor; even VDMSound never fixed it (it's "smooth but slow").
 2. **FM content** (Skyroads): some instruments missing / not quite right. **`[b18-oplbuf]` improved write timing** — drained register writes now go through Nuked's timestamped write buffer (`OPL3_WriteRegBuffered`), spread at hardware-accurate 2-sample spacing instead of all collapsing onto the block's first sample (worst on render-thread catch-up). **Not yet A/B'd on the VM.** OPL3 bank-1 (`0x38A/0x38B`) was already handled correctly in `opl_module.c` — the old "verify bank-1" suspicion was stale. Still open: true per-burst sample-accurate timing needs timestamps on the SPSC queue entries (the ~16 ms inter-burst quantization still stands); and SB Pro's OPL mirror at `0x220-0x223/0x228-9` isn't forwarded to the OPL core, so a game driving FM through those instead of `0x388` would lose it (Skyroads uses `0x388`, so not its cause).
-3. **SB digital PCM/DMA**: **8-bit PLAYS on the VM** (`[b22-dmadirect]`, Duke3D setup + Skyroads), but two open issues:
-   - **8-bit is glitchy.** Suspects (unconfirmed): render thread starved on the shared core-0 affinity pin; gaps between single-cycle blocks; or the IRQ being posted from the render thread ~384 ms ahead of the play cursor.
-   - **16-bit is silent.** The `sb_channel >= 4` word-granular address/count path (`sb_module.c` `sb_start`) is unverified — needs a `VDDQueryDMA(ch5)` trace to confirm the address math.
-   Key finding: **`VDDRequestDMA` returns 0 on this NTVDM even on the VDM thread with the channel unmasked and a live count** — so we abandoned it and read guest PCM directly via `VDDQueryDMA` (gives addr/count/page; layout `{addr,count,page,...}`, phys = `(page<<16)|addr`) + `MGetVdmPointer`. That works. IRQ5 via `call_ica_hw_interrupt(0,5,1)` appears to function (8-bit single-cycle completes). Remaining TUNE: 16-bit, SB16 length convention, ADPCM, direct-DAC `0x10`, mixer volumes.
+3. **SB digital PCM/DMA**: **8-bit plays the correct sounds on the VM** (`[b30-pcm8]`, Skyroads). The path that got there (all verified by trace + ear):
+   - `VDDRequestDMA` returns **0** on this NTVDM even on the VDM thread with the channel unmasked and a live count — abandoned it. Read guest PCM directly via **`VDDQueryDMA`** (layout `{addr,count,page,...}`, phys = `(page<<16)|addr`) + **`MGetVdmPointer`**.
+   - **Snapshot** the whole buffer into private memory at `sb_start` (VDM thread) — the render thread reads ~384 ms ahead of the play cursor, and Skyroads re-fires the same buffer ~0.275 s apart, so reading guest memory live tore the audio. This was the gross crackle.
+   - **Signedness auto-detect** from the buffer (`0x00`-dominated = signed): Skyroads sends *signed* data via the spec-*unsigned* `0x14`.
+   - Underrun ruled out (`peak chunks/wake=1` after `timeBeginPeriod(1)` + TIME_CRITICAL render thread); clipping ruled out (halving PCM didn't help).
+   - **Residual:** mild crackle remains. Not data/timing/clipping — it's our **linear resampler** imaging the low-rate (6024/8000/4000 Hz) sources. Native NTVDM plays the same PCM cleanly (it resamples better, likely via a native-rate DirectSound buffer). Fixing = a better resampler or per-stream native-rate DS buffer.
+   - **16-bit** (`sb_channel>=4` word-granular path) still unverified — needs a 16-bit trace.
 4. **Glitchiness vs VDMSound smoothness**: was a small ~96 ms DirectSound ring buffer underrunning (VDMSound used ~1.5 s). **`[b17-bigbuf]` enlarged it to ~384 ms** (`audio_out.c`, `NUM_CHUNKS` 6→24) — applied in code, **not yet verified on the VM**. If glitches persist, bump `NUM_CHUNKS` further (32 ≈ 512 ms).
 
 ## Recommended next steps (ranked)
 1. **Enlarge the DirectSound buffer** — **DONE in `[b17-bigbuf]`** (`audio_out.c`, `NUM_CHUNKS` 6→24 ≈ 384 ms). Pending on-VM confirmation it removes the FM glitching; headroom to ~512 ms (`NUM_CHUNKS` 32) if needed.
 2. **Fix FM content** — **partly done in `[b18-oplbuf]`** (writes now via `OPL3_WriteRegBuffered`; bank-1 verified already-correct). Still open, needs on-VM A/B testing: per-burst sample-accurate timing (timestamp the SPSC queue entries + render in segments between writes) and optionally forwarding the SB Pro OPL mirror ports to the OPL core. (`opl_module.c`.)
-3. **SB16 digital DSP+DMA** path — **8-bit WORKS** (`[b22-dmadirect]`, direct guest-memory DMA read; `VDDRequestDMA` was a dead end on this NTVDM). Now: (a) de-glitch 8-bit, (b) make 16-bit play (`VDDQueryDMA(ch5)` trace → fix word-granular addressing), (c) then ADPCM / direct-DAC / mixer volumes.
+3. **SB16 digital DSP+DMA** path — **8-bit plays correct sounds** (`[b30-pcm8]`). Remaining: (a) optional — better resampler to kill the residual imaging crackle (native-rate DirectSound buffer or a band-limited resampler), (b) 16-bit play (`VDDQueryDMA(ch5)` trace → fix word-granular addressing), (c) ADPCM / direct-DAC / mixer volumes. (Note: `sb_module.c` still carries per-transfer diagnostic notes — strip when stable.)
 4. **Timebase takeover spike** (hook PIT `0x40-0x43` AND drive IRQ0, both from QPC, without fighting NTVDM). Only thing that might beat everyone on timing; high effort/fragile; may still lose. Treat as a research spike, not a commitment.
 
 ---
