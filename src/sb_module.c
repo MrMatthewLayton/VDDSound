@@ -45,9 +45,14 @@
 
 /* DIAG(b46): when 1, ignore the guest buffer and feed a pure tone instead, to
  * test whether the DirectSound PCM OUTPUT path (8-bit, odd rate, resampled,
- * looping) is itself clean. A clean tone exonerates the output path (the
- * garbage is then the guest data / our read); a garbled tone indicts it. */
-#define SB_TONE_TEST 1
+ * looping) is itself clean. RESULT: tone is clean in both games => the output
+ * path is fine; the garbage is the guest data / our read. Now 0. */
+#define SB_TONE_TEST 0
+
+/* DIAG(b47): capture the exact bytes we feed to DirectSound (post-convert) to
+ * C:\vddsound\dump.wav so it can be played back to SEE what we're reading -
+ * noise = wrong memory, glitchy/repeating = tearing, wrong speed = stride. */
+#define SB_WAV_DUMP 1
 
 /* ---- detection FIFO (VDM thread only) ----------------------------------- */
 static BYTE     sb_fifo[SB_FIFO_SIZE];
@@ -113,6 +118,12 @@ static int      sb_diag_pull_logged;   /* DIAG(b20): one-shot render-pull trace 
 
 /* ---- health (render thread only) ---------------------------------------- */
 static unsigned sb_diag_tick_acc;    /* playing ticks since last health log */
+
+#if SB_WAV_DUMP
+static BYTE     sb_dump[262144];     /* captured fed bytes -> dump.wav */
+static unsigned sb_dump_pos, sb_dump_rate, sb_dump_bits, sb_dump_ch;
+static int      sb_dump_done;
+#endif
 
 /* ------------------------------------------------------------------------- */
 
@@ -562,6 +573,45 @@ static int sb_cubic(int p0, int p1, int p2, int p3, int f)
     return p1 + (int)((f * inner) >> 17);
 }
 
+#if SB_WAV_DUMP
+/* Write the captured fed bytes to C:\vddsound\dump.wav (8-bit PCM is unsigned,
+ * which is exactly what we feed DirectSound). One-shot. */
+static void sb_write_wav(void)
+{
+    HANDLE h;
+    DWORD  wr;
+    BYTE   hdr[44];
+    unsigned dlen = sb_dump_pos;
+    unsigned flen = 36u + dlen;
+    unsigned brate = sb_dump_rate * sb_dump_ch * (sb_dump_bits / 8u);
+    unsigned balign = sb_dump_ch * (sb_dump_bits / 8u);
+
+    hdr[0]='R'; hdr[1]='I'; hdr[2]='F'; hdr[3]='F';
+    hdr[4]=(BYTE)flen; hdr[5]=(BYTE)(flen>>8); hdr[6]=(BYTE)(flen>>16); hdr[7]=(BYTE)(flen>>24);
+    hdr[8]='W'; hdr[9]='A'; hdr[10]='V'; hdr[11]='E';
+    hdr[12]='f'; hdr[13]='m'; hdr[14]='t'; hdr[15]=' ';
+    hdr[16]=16; hdr[17]=0; hdr[18]=0; hdr[19]=0;
+    hdr[20]=1; hdr[21]=0;                                  /* PCM */
+    hdr[22]=(BYTE)sb_dump_ch; hdr[23]=0;
+    hdr[24]=(BYTE)sb_dump_rate; hdr[25]=(BYTE)(sb_dump_rate>>8);
+    hdr[26]=(BYTE)(sb_dump_rate>>16); hdr[27]=(BYTE)(sb_dump_rate>>24);
+    hdr[28]=(BYTE)brate; hdr[29]=(BYTE)(brate>>8); hdr[30]=(BYTE)(brate>>16); hdr[31]=(BYTE)(brate>>24);
+    hdr[32]=(BYTE)balign; hdr[33]=(BYTE)(balign>>8);
+    hdr[34]=(BYTE)sb_dump_bits; hdr[35]=0;
+    hdr[36]='d'; hdr[37]='a'; hdr[38]='t'; hdr[39]='a';
+    hdr[40]=(BYTE)dlen; hdr[41]=(BYTE)(dlen>>8); hdr[42]=(BYTE)(dlen>>16); hdr[43]=(BYTE)(dlen>>24);
+
+    h = CreateFileA("C:\\vddsound\\dump.wav", GENERIC_WRITE, 0, NULL,
+                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        WriteFile(h, hdr, 44, &wr, NULL);
+        WriteFile(h, sb_dump, dlen, &wr, NULL);
+        CloseHandle(h);
+    }
+    logger_note_kv("sb: wrote dump.wav bytes", (unsigned long)dlen);
+}
+#endif
+
 void sb_mix(int16_t *buf, unsigned frames)
 {
     unsigned step, i;
@@ -642,6 +692,24 @@ void sb_mix(int16_t *buf, unsigned frames)
                 CopyMemory(sb_snapshot, sb_dma_ptr + sb_dma_pos, want);
                 if (sb_bits == 8 && sb_signed)
                     for (k = 0; k < want; k++) sb_snapshot[k] ^= 0x80u;
+#endif
+#if SB_WAV_DUMP
+                if (!sb_dump_done) {            /* capture the fed stream to a WAV */
+                    unsigned room, cpy;
+                    if (sb_dump_pos == 0u) {
+                        sb_dump_rate = sb_rate;
+                        sb_dump_bits = (unsigned)sb_bits;
+                        sb_dump_ch   = sb_stereo ? 2u : 1u;
+                    }
+                    room = (unsigned)sizeof(sb_dump) - sb_dump_pos;
+                    cpy  = (want < room) ? want : room;
+                    CopyMemory(sb_dump + sb_dump_pos, sb_snapshot, cpy);
+                    sb_dump_pos += cpy;
+                    if (sb_dump_pos >= (unsigned)sizeof(sb_dump)) {
+                        sb_write_wav();
+                        sb_dump_done = 1;
+                    }
+                }
 #endif
                 sb_load_fp     = audio_pcm_play(sb_snapshot, want);
                 sb_dma_pos    += want;
