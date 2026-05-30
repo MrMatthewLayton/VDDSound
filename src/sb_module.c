@@ -551,9 +551,25 @@ void sb_mix(int16_t *buf, unsigned frames)
         if (lead < sb_diag_min_lead) sb_diag_min_lead = lead;
         if (frame && lead < frame && sb_diag_fed_total > 0u) sb_diag_underruns++;
         if (++sb_diag_tick_acc >= 1024u) {
+            unsigned f = sb_dma_pos, zrun = 0, frontier = sb_dma_pos;
             logger_note_kv("sb: min lead bytes /1k ticks", (unsigned long)sb_diag_min_lead);
             logger_note_kv("sb: lead underruns /1k ticks", (unsigned long)sb_diag_underruns);
             logger_note_kv("sb: target lead bytes", (unsigned long)target);
+            /* DIAG(b36): find the guest's fill frontier - the end of real data,
+             * i.e. the start of a long run of source-silence (0x00, unwritten
+             * DMA). If our read pos sits at/near the frontier the game has not
+             * filled that far yet, so we feed unwritten silence into real audio
+             * = tearing crackle. The frontier's advance rate per ~1s window is
+             * the game's true (NTVDM-paced) DMA fill rate - what the fix paces
+             * to. Pure guest-memory reads: no cross-thread VDD API. */
+            while (f < sb_dma_len && zrun < 64u) {
+                if (sb_dma_ptr[f] == 0x00u) zrun++;
+                else { zrun = 0; frontier = f; }
+                f++;
+            }
+            logger_note_kv("sb: read pos", (unsigned long)sb_dma_pos);
+            logger_note_kv("sb: fill frontier", (unsigned long)frontier);
+            logger_note_kv("sb: fill margin ahead", (unsigned long)(frontier - sb_dma_pos));
             sb_diag_tick_acc  = 0;
             sb_diag_min_lead  = 0xFFFFFFFFu;
             sb_diag_underruns = 0;
@@ -572,7 +588,7 @@ void sb_mix(int16_t *buf, unsigned frames)
                     for (k = 0; k < want; k++) sb_snapshot[k] ^= 0x80u;
                 /* DIAG(b35): show the actual bytes we feed for the first dozen
                  * sizable feeds. */
-                if (sb_diag_feeds < 12 && want >= 16u) {
+                if (sb_diag_feeds < 6 && want >= 16u) {
                     logger_note_kv("sb: feed want", (unsigned long)want);
                     logger_note_kv("sb: feed lead", (unsigned long)lead);
                     sb_diag_hex("sb fed", sb_snapshot, want);
