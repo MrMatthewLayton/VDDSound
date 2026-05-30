@@ -575,14 +575,16 @@ void sb_mix(int16_t *buf, unsigned frames)
 
         /* SB16 ACK-gate: don't consume the next block until the guest has acked
          * the previous block's IRQ (it clears the pending flag by reading
-         * 0x22E/0x22F), so the guest's refills stay locked to our reads. Safety:
-         * proceed after ~64 ticks so a guest that stops acking can't wedge us
-         * into permanent silence. */
+         * 0x22E/0x22F), so our read stays ~1 block ahead of the guest's refill
+         * instead of lapping its small DMA ring. The safety threshold must be a
+         * genuine last-resort (only a multi-second guest stall), NOT a normal
+         * path: at 64 ticks it fired constantly and let us read 21 blocks ahead
+         * (b44 trace, posts-acks=21), lapping DOOM's 8-block ring = garbage. */
         if (!(sb_bits < 16 ? sb_irq8_pending : sb_irq16_pending)) sb_gate_wait = 0;
         else sb_gate_wait++;
 
         if (frame && sb_block_bytes &&
-            (sb_gate_wait == 0 || sb_gate_wait >= 64u)) {
+            (sb_gate_wait == 0 || sb_gate_wait >= 2000u)) {
             LARGE_INTEGER now;
             unsigned long long elapsed, base64;
             unsigned base, scale_fp, want, cap, avail, tonext, overshoot, k;
@@ -653,6 +655,7 @@ void sb_mix(int16_t *buf, unsigned frames)
             logger_note_kv("sb: bytes transferred", (unsigned long)sb_xfer_total);
             logger_note_kv("sb: irq posts", (unsigned long)sb_irq_posts);
             logger_note_kv("sb: irq acks", (unsigned long)sb_irq_acks);
+            logger_note_kv("sb: gate wait now", (unsigned long)sb_gate_wait);
             logger_note_kv("sb: live DMA count", (unsigned long)qi[1]);
             sb_diag_tick_acc = 0;
         }
