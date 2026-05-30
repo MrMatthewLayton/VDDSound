@@ -85,6 +85,11 @@ PBYTE WINAPI MGetVdmPointer(ULONG Address, ULONG Size, BOOL ProtectedMode);
 ULONG WINAPI VDDRequestDMA(HANDLE hVdd, ULONG iChannel, PVOID Buffer,
                            ULONG Length);
 
+/* Report NTVDM's view of a DMA channel (addr/count/page/mode/mask) into a
+ * VDD_DMA_INFO struct; non-consuming. Used to diagnose why VDDRequestDMA
+ * returns nothing. pDmaInfo is a caller buffer (>= sizeof(VDD_DMA_INFO)). */
+VOID WINAPI VDDQueryDMA(HANDLE hVdd, ULONG iChannel, PVOID pDmaInfo);
+
 /* Post a hardware IRQ into the guest's 8259(s). ica = controller (0 = master,
  * lines 0-7; 1 = slave, lines 8-15), line = IRQ line on that controller, count
  * = number of interrupts to inject. The SB completion IRQ5 is (0, 5, 1).

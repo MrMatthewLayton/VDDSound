@@ -73,8 +73,12 @@ static int      sb_stereo;         /* 0/1 */
 static int      sb_signed;         /* sample encoding signed? */
 static int      sb_autoinit;       /* 0/1 */
 static unsigned sb_channel;        /* DMA channel in use */
-static unsigned sb_block_bytes;    /* bytes per block (IRQ pacing) */
-static unsigned sb_bytes_left;     /* bytes remaining in current block */
+static unsigned sb_block_bytes;    /* DSP-command block length (cross-check) */
+/* Guest DMA buffer mapped directly: VDDRequestDMA returns 0 on this NTVDM, so
+ * we read PCM straight from guest memory via VDDQueryDMA + MGetVdmPointer. */
+static const BYTE *sb_dma_ptr;     /* host pointer to the guest DMA buffer */
+static unsigned    sb_dma_len;     /* buffer length in bytes */
+static unsigned    sb_dma_pos;     /* play cursor within the buffer */
 
 /* ---- IRQ flags (atomic; render sets, VDM acks) -------------------------- */
 static volatile LONG sb_irq8_pending;
@@ -87,6 +91,7 @@ static unsigned sb_stage_head, sb_stage_pos;
 static int      sb_have_cur;
 static int      sb_cur_l, sb_cur_r, sb_nxt_l, sb_nxt_r;
 static unsigned sb_phase;          /* 16.16 fractional position cur->nxt */
+static int      sb_diag_pull_logged;   /* DIAG(b20): one-shot render-pull trace */
 
 /* ------------------------------------------------------------------------- */
 
@@ -143,7 +148,6 @@ static void sb_start(int bits, int stereo, int sgnd, unsigned channel,
     sb_channel     = channel;
     sb_autoinit    = autoinit;
     sb_block_bytes = block_bytes ? block_bytes : 1u;
-    sb_bytes_left  = sb_block_bytes;
     sb_rate        = dsp_rate ? dsp_rate : 11025u;
     sb_paused      = 0;
     /* reset the resampler/staging so we don't reuse the previous stream. */
@@ -151,14 +155,49 @@ static void sb_start(int bits, int stereo, int sgnd, unsigned channel,
     sb_phase       = 0;
     sb_stage_head  = sb_stage_pos = 0;
     sb_play        = 1;
+    sb_diag_pull_logged = 0;
     logger_note_kv("sb: dma start, rate", (unsigned long)sb_rate);
     logger_note_kv("sb: dma start, bytes", (unsigned long)sb_block_bytes);
+    logger_note_kv("sb: start bits", (unsigned long)sb_bits);
+    logger_note_kv("sb: start stereo", (unsigned long)sb_stereo);
+    logger_note_kv("sb: start chan", (unsigned long)sb_channel);
+    logger_note_kv("sb: start autoinit", (unsigned long)sb_autoinit);
+    /* Map the guest DMA buffer directly. VDDRequestDMA returns 0 on this NTVDM,
+     * but VDDQueryDMA reports the channel state and MGetVdmPointer maps the
+     * buffer, so we read PCM straight from guest memory (the VDMSound way). */
+    {
+        WORD  info[16];
+        ULONG lin, cnt;
+        ZeroMemory(info, sizeof(info));
+        VDDQueryDMA(sb_hvdd, sb_channel, info);
+        /* VDD_DMA_INFO {addr, count, page, ...}; phys = (page<<16)|addr. 8-bit
+         * DMA is byte-granular; 16-bit DMA (ch >= 4) is word-granular. TUNE. */
+        if (sb_channel >= 4u) {
+            lin = ((ULONG)(info[2] & 0xFFu) << 16) | ((ULONG)info[0] << 1);
+            cnt = ((ULONG)info[1] + 1u) * 2u;
+        } else {
+            lin = ((ULONG)(info[2] & 0xFFu) << 16) | info[0];
+            cnt = (ULONG)info[1] + 1u;
+        }
+        sb_dma_len = cnt;
+        sb_dma_pos = 0;
+        sb_dma_ptr = (cnt > 1u && cnt < 0x1000000u)
+                     ? (const BYTE *)MGetVdmPointer(lin, cnt, FALSE) : NULL;
+        logger_note_kv("sb: dma lin", (unsigned long)lin);
+        logger_note_kv("sb: dma len", (unsigned long)cnt);
+        logger_note_kv("sb: dma ptr ok", (unsigned long)(sb_dma_ptr != NULL));
+    }
+    if (!sb_dma_ptr) {
+        sb_play = 0;
+        logger_note("sb: no DMA pointer - not playing");
+    }
 }
 
 static void sb_stop(void)
 {
-    sb_play   = 0;
-    sb_paused = 0;
+    sb_play    = 0;
+    sb_paused  = 0;
+    sb_dma_ptr = NULL;
 }
 
 /* ---- DSP command FSM (VDM thread, under sb_cs via sb_outb) --------------- */
@@ -354,14 +393,14 @@ static void sb_decode_frame(const BYTE *p, int16_t *l, int16_t *r)
  * 0 on block end (single-cycle: stops) or guest underrun. */
 static unsigned sb_refill_stage(void)
 {
-    unsigned frame, want, got, frames, i;
+    unsigned frame, want, avail, frames, i;
 
-    if (!sb_play) return 0;
+    if (!sb_play || !sb_dma_ptr) return 0;
 
-    if (sb_bytes_left == 0) {           /* previous block fully consumed */
+    if (sb_dma_pos >= sb_dma_len) {      /* block fully played */
         sb_post_irq();
         if (sb_autoinit) {
-            sb_bytes_left = sb_block_bytes;
+            sb_dma_pos = 0;             /* replay; the guest keeps refilling it */
         } else {
             sb_play = 0;
             return 0;
@@ -371,18 +410,28 @@ static unsigned sb_refill_stage(void)
     frame = (unsigned)(sb_bits / 8) * (sb_stereo ? 2u : 1u);
     if (frame == 0) { sb_play = 0; return 0; }
 
+    avail = sb_dma_len - sb_dma_pos;
     want = SB_STAGE_RAW_BYTES;
-    if (want > sb_bytes_left) want = sb_bytes_left;
+    if (want > avail) want = avail;
     want -= want % frame;
-    if (want == 0) { sb_bytes_left = 0; return 0; }
+    if (want == 0) { sb_dma_pos = sb_dma_len; return 0; }
 
-    got = VDDRequestDMA(sb_hvdd, sb_channel, sb_raw, want);
-    if (got > want) got = want;
-    got -= got % frame;
-    if (got == 0) return 0;             /* guest underrun: silence, retry */
+    CopyMemory(sb_raw, sb_dma_ptr + sb_dma_pos, want);
+    if (!sb_diag_pull_logged && want >= 8) {   /* DIAG: confirm real PCM */
+        sb_diag_pull_logged = 1;
+        logger_note_kv("sb: read pos", (unsigned long)sb_dma_pos);
+        logger_note_kv("sb: read 0-3",
+                       (unsigned long)(sb_raw[0] | (sb_raw[1] << 8)
+                       | ((unsigned long)sb_raw[2] << 16)
+                       | ((unsigned long)sb_raw[3] << 24)));
+        logger_note_kv("sb: read 4-7",
+                       (unsigned long)(sb_raw[4] | (sb_raw[5] << 8)
+                       | ((unsigned long)sb_raw[6] << 16)
+                       | ((unsigned long)sb_raw[7] << 24)));
+    }
+    sb_dma_pos += want;
 
-    sb_bytes_left -= got;
-    frames = got / frame;
+    frames = want / frame;
     for (i = 0; i < frames; i++) {
         sb_decode_frame(sb_raw + i * frame, &sb_stage[2 * i], &sb_stage[2 * i + 1]);
     }
