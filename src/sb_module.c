@@ -79,8 +79,12 @@ static unsigned sb_block_bytes;    /* DSP-command block length (cross-check) */
 static const BYTE *sb_dma_ptr;     /* host pointer to the guest DMA buffer */
 static unsigned    sb_dma_len;     /* buffer length in bytes */
 static unsigned    sb_dma_pos;     /* play cursor within the buffer */
-static unsigned    sb_irq_accum;   /* bytes fed since the last block-completion IRQ */
 static unsigned    sb_gate_wait;   /* render ticks spent waiting for a block-IRQ ack */
+static unsigned    sb_byterate;    /* programmed playback bytes/sec (rate*frame) */
+static unsigned    sb_xfer_total;  /* bytes transferred this transfer (IRQ accounting) */
+static unsigned    sb_load_fp;     /* DS playback load feedback, 8.8 fp (256 = on-target) */
+static unsigned long long sb_qpc_freq;   /* QueryPerformanceFrequency (ticks/sec) */
+static LARGE_INTEGER      sb_last_qpc;    /* QPC at the last metering tick */
 static unsigned    sb_base_addr;   /* 8237 base address register at transfer start */
 static unsigned    sb_base_count;  /* 8237 base count (transfers-1) at transfer start */
 static unsigned    sb_base_page;   /* 8237 page register at transfer start */
@@ -101,13 +105,8 @@ static int      sb_p0l, sb_p0r, sb_p1l, sb_p1r, sb_p2l, sb_p2r, sb_p3l, sb_p3r;
 static unsigned sb_phase;          /* 16.16 fractional position p1->p2 */
 static int      sb_diag_pull_logged;   /* DIAG(b20): one-shot render-pull trace */
 
-/* ---- b35 feed-path diagnostics (render thread only) --------------------- */
-static int      sb_diag_feeds;       /* fed-byte hex dumps emitted this transfer */
-static unsigned sb_diag_min_lead;    /* min lead (bytes) seen this window */
-static unsigned sb_diag_underruns;   /* ticks the lead hit ~0 mid-stream */
+/* ---- health (render thread only) ---------------------------------------- */
 static unsigned sb_diag_tick_acc;    /* playing ticks since last health log */
-static unsigned sb_diag_fed_total;   /* total bytes fed to DS this transfer */
-static int      sb_diag_req;         /* VDDRequestDMA return dumps emitted */
 
 /* ------------------------------------------------------------------------- */
 
@@ -142,6 +141,11 @@ void sb_init(HANDLE hVdd)
     sb_speaker = 1;           /* SB16: speaker is always on (0xD1/0xD3 are no-ops) */
     mixer_regs[0x80] = 0x02;  /* IRQ select: IRQ5 */
     mixer_regs[0x81] = 0x22;  /* DMA select: DMA1 (8-bit) + DMA5 (16-bit) */
+    {
+        LARGE_INTEGER f;
+        sb_qpc_freq = (QueryPerformanceFrequency(&f) && f.QuadPart)
+                      ? (unsigned long long)f.QuadPart : 1ull;
+    }
     InitializeCriticalSection(&sb_cs);
     InterlockedExchange(&sb_cs_ready, 1);
 }
@@ -188,17 +192,16 @@ static void sb_start(int bits, int stereo, int sgnd, unsigned channel,
     sb_phase       = 0;
     sb_stage_head  = sb_stage_pos = 0;
     sb_play        = 1;
-    sb_irq_accum   = 0;
     sb_gate_wait   = 0;
+    /* metering state: byte-rate = rate * frame; reset transfer + load + clock. */
+    sb_byterate    = sb_rate * ((unsigned)(bits / 8) * (stereo ? 2u : 1u));
+    sb_xfer_total  = 0;
+    sb_load_fp     = 256u;     /* assume on-target until the sink reports back */
+    QueryPerformanceCounter(&sb_last_qpc);
     InterlockedExchange(&sb_irq_posts, 0);   /* DIAG(b38) */
     InterlockedExchange(&sb_irq_acks, 0);
     sb_diag_pull_logged = 0;
-    sb_diag_feeds     = 0;
-    sb_diag_min_lead  = 0xFFFFFFFFu;
-    sb_diag_underruns = 0;
     sb_diag_tick_acc  = 0;
-    sb_diag_fed_total = 0;
-    sb_diag_req       = 0;
     logger_note_kv("sb: dma start, rate", (unsigned long)sb_rate);
     logger_note_kv("sb: dma start, bytes", (unsigned long)sb_block_bytes);
     logger_note_kv("sb: start bits", (unsigned long)sb_bits);
@@ -315,6 +318,13 @@ static void dsp_execute(BYTE cmd, const BYTE *a)
         break;
     case 0x14: case 0x91: {                 /* 8-bit single-cycle output */
         unsigned len = (((unsigned)a[1] << 8) | a[0]) + 1u;
+        if (len < 32u) {   /* tiny transfer = SB detection blip (VDMSound quick-
+                            * DMA): ack it so detection completes, but don't churn
+                            * the audio buffer playing garbage. */
+            InterlockedExchange(&sb_irq8_pending, 1);
+            call_ica_hw_interrupt(0, SB_IRQ, 1);
+            break;
+        }
         sb_start(8, (mixer_regs[0x0E] & 0x02) ? 1 : 0, 0, SB_DMA8, 0, len);
         break;
     }
@@ -341,6 +351,12 @@ static void dsp_execute(BYTE cmd, const BYTE *a)
             ch       = (bits == 16) ? SB_DMA16 : SB_DMA8;
             frame    = (unsigned)(bits / 8) * (stereo ? 2u : 1u);
             bytes    = len * frame;              /* TUNE: length convention */
+            if (!autoinit && bytes < 32u) {      /* detection blip (quick-DMA) */
+                InterlockedExchange(bits == 16 ? &sb_irq16_pending
+                                               : &sb_irq8_pending, 1);
+                call_ica_hw_interrupt(0, SB_IRQ, 1);
+                break;
+            }
             sb_start(bits, stereo, sgnd, ch, autoinit, bytes);
         }
         /* other commands: accepted and ignored. */
@@ -540,29 +556,6 @@ static int sb_cubic(int p0, int p1, int p2, int p3, int f)
     return p1 + (int)((f * inner) >> 17);
 }
 
-/* DIAG(b35): dump up to 32 bytes as hex (the bytes we actually feed to
- * DirectSound, post signed->unsigned convert). Smooth ramps => the bug is in
- * the DS streaming-buffer mechanics; jagged garbage => the bug is upstream in
- * how we read/convert the guest buffer. CRT-free hand-rolled formatting. */
-static void sb_diag_hex(const char *tag, const BYTE *p, unsigned n)
-{
-    static const char hexd[] = "0123456789ABCDEF";
-    char line[160];
-    int pos = 0;
-    unsigned i;
-    while (*tag && pos < 28) line[pos++] = *tag++;
-    line[pos++] = ':';
-    line[pos++] = ' ';
-    if (n > 32u) n = 32u;
-    for (i = 0; i < n; i++) {
-        line[pos++] = hexd[(p[i] >> 4) & 0xFu];
-        line[pos++] = hexd[p[i] & 0xFu];
-        line[pos++] = ' ';
-    }
-    line[pos] = '\0';
-    logger_note(line);
-}
-
 void sb_mix(int16_t *buf, unsigned frames)
 {
     unsigned step, i;
@@ -570,153 +563,98 @@ void sb_mix(int16_t *buf, unsigned frames)
     if (!InterlockedCompareExchange(&sb_cs_ready, 1, 1)) return;
     EnterCriticalSection(&sb_cs);
 
-    /* Stream guest PCM to DirectSound LIVE: hold a ~20ms lead by reading the
-     * guest buffer just behind the play cursor (like the hardware DMA), 8-bit
-     * signed->unsigned for DS. The old in-driver resampler below is unreachable
-     * (kept so its helpers still compile). */
+    /* Meter guest PCM to DirectSound the VDMSound way: consume bytes by
+     * wall-clock elapsed x the guest's programmed byte-rate x a feedback scale
+     * (1/load) from how full the playback buffer is, capped to one DSP block
+     * (<=1 IRQ) and the DMA terminal count; push to a big looping DS buffer that
+     * returns the load factor. ACK-gated on SB16 so we stay locked to the guest.
+     * The old in-driver resampler below is unreachable (kept so its helpers
+     * still compile). */
     if (sb_play && !sb_paused && sb_dma_ptr) {
-        unsigned frame  = (unsigned)(sb_bits / 8) * (sb_stereo ? 2u : 1u);
-        unsigned target = frame ? (sb_rate * frame) / 25u : 0u;   /* ~40 ms */
-        unsigned lead   = audio_pcm_lead();
+        unsigned frame = (unsigned)(sb_bits / 8) * (sb_stereo ? 2u : 1u);
 
-        /* DIAG(b35): lead/pacing health. If the lead frequently hits ~0 the DS
-         * play cursor is lapping our writes (underrun) - that would BE the
-         * crackle. Logged once per ~1s of playing ticks. */
-        if (lead < sb_diag_min_lead) sb_diag_min_lead = lead;
-        if (frame && lead < frame && sb_diag_fed_total > 0u) sb_diag_underruns++;
-        if (++sb_diag_tick_acc >= 1024u) {
-            unsigned f = sb_dma_pos, zrun = 0, frontier = sb_dma_pos;
-            logger_note_kv("sb: min lead bytes /1k ticks", (unsigned long)sb_diag_min_lead);
-            logger_note_kv("sb: lead underruns /1k ticks", (unsigned long)sb_diag_underruns);
-            logger_note_kv("sb: target lead bytes", (unsigned long)target);
-            /* DIAG(b36): find the guest's fill frontier - the end of real data,
-             * i.e. the start of a long run of source-silence (0x00, unwritten
-             * DMA). If our read pos sits at/near the frontier the game has not
-             * filled that far yet, so we feed unwritten silence into real audio
-             * = tearing crackle. The frontier's advance rate per ~1s window is
-             * the game's true (NTVDM-paced) DMA fill rate - what the fix paces
-             * to. Pure guest-memory reads: no cross-thread VDD API. */
-            while (f < sb_dma_len && zrun < 64u) {
-                if (sb_dma_ptr[f] == 0x00u) zrun++;
-                else { zrun = 0; frontier = f; }
-                f++;
-            }
-            logger_note_kv("sb: read pos", (unsigned long)sb_dma_pos);
-            logger_note_kv("sb: fill frontier", (unsigned long)frontier);
-            logger_note_kv("sb: fill margin ahead", (unsigned long)(frontier - sb_dma_pos));
-            logger_note_kv("sb: irq posts (cumulative)", (unsigned long)sb_irq_posts);
-            logger_note_kv("sb: irq acks (cumulative)", (unsigned long)sb_irq_acks);
-            logger_note_kv("sb: DS underruns (overtake)", (unsigned long)audio_pcm_underruns());
-            /* DIAG(b39): does NTVDM's emulated DMA cursor advance? We never call
-             * VDDRequestDMA, so the 8237 count may be frozen at its initial
-             * value. If it DECREASES over windows, NTVDM is pacing the channel
-             * and we can sync our read to it (the guest's own clock) to stop the
-             * tearing; if frozen, we must drive the DMA to advance it. Safe from
-             * the render thread - we already raise IRQs (call_ica_hw_interrupt)
-             * from here. */
-            {
-                WORD qi[16];
-                ZeroMemory(qi, sizeof(qi));
-                VDDQueryDMA(sb_hvdd, sb_channel, qi);
-                logger_note_kv("sb: live DMA count", (unsigned long)qi[1]);
-                logger_note_kv("sb: live DMA addr", (unsigned long)qi[0]);
-            }
-            sb_diag_tick_acc  = 0;
-            sb_diag_min_lead  = 0xFFFFFFFFu;
-            sb_diag_underruns = 0;
-        }
-
-        /* SB16 ACK-gate (b43): don't consume the next block until the guest has
-         * acked the previous block's IRQ (it clears the pending flag by reading
-         * 0x22E/0x22F). The trace showed irq posts running ~600 ms ahead of acks
-         * because we post on FEED (far ahead of playback): DOOM then refilled
-         * each block long after we'd already re-read it stale = chk-a-chk-a.
-         * Gating caps the outstanding IRQ pipeline at one block so refills stay
-         * locked to our reads (VDMSound's back-pressure model). Safety: feed
-         * anyway after ~64 ticks so a guest that stops acking can't wedge us into
-         * permanent silence. */
+        /* SB16 ACK-gate: don't consume the next block until the guest has acked
+         * the previous block's IRQ (it clears the pending flag by reading
+         * 0x22E/0x22F), so the guest's refills stay locked to our reads. Safety:
+         * proceed after ~64 ticks so a guest that stops acking can't wedge us
+         * into permanent silence. */
         if (!(sb_bits < 16 ? sb_irq8_pending : sb_irq16_pending)) sb_gate_wait = 0;
         else sb_gate_wait++;
 
-        if (frame && lead < target && (sb_gate_wait == 0 || sb_gate_wait >= 64u)) {
-            unsigned want  = target - lead;
-            unsigned avail = sb_dma_len - sb_dma_pos;
-            unsigned k, fed;
-            if (want > avail)               want = avail;
-            if (want > sizeof(sb_snapshot)) want = sizeof(sb_snapshot);
-            if (want > sb_block_bytes)      want = sb_block_bytes; /* <=1 IRQ/feed */
+        if (frame && sb_block_bytes &&
+            (sb_gate_wait == 0 || sb_gate_wait >= 64u)) {
+            LARGE_INTEGER now;
+            unsigned long long elapsed, base64;
+            unsigned base, scale_fp, want, cap, avail, tonext, overshoot, k;
+
+            QueryPerformanceCounter(&now);
+            elapsed = (unsigned long long)(now.QuadPart - sb_last_qpc.QuadPart);
+            sb_last_qpc = now;
+
+            /* bytes earned this tick = byte-rate * elapsed-seconds, scaled by the
+             * playback feedback (1/load in 8.8 fp, clamped to [0, 2]). */
+            base64   = (unsigned long long)sb_byterate * elapsed / sb_qpc_freq;
+            base     = (base64 > sizeof(sb_snapshot)) ? (unsigned)sizeof(sb_snapshot)
+                                                      : (unsigned)base64;
+            scale_fp = 65536u / (sb_load_fp ? sb_load_fp : 1u);
+            if (scale_fp > 512u) scale_fp = 512u;
+            want = (base * scale_fp) / 256u;
+
+            /* cap to the next DSP-block boundary (so <=1 IRQ) and the DMA
+             * terminal count; round up tiny leftovers to the boundary. */
+            avail  = sb_dma_len - sb_dma_pos;
+            tonext = sb_block_bytes - (sb_xfer_total % sb_block_bytes);
+            cap    = (tonext < avail) ? tonext : avail;
+            want  -= want % frame;
+            if (want > cap)             want = cap;
+            else if (cap - want < 128u) want = cap;
             want -= want % frame;
+
             if (want > 0) {
                 CopyMemory(sb_snapshot, sb_dma_ptr + sb_dma_pos, want);
-                /* DIAG(b35/b39): raw (pre-xor) then fed (post-xor) bytes. Raw
-                 * centered on 0x80 = unsigned source; centered on 0x00 = signed
-                 * source. Lets us read signedness off the data, not the guess. */
-                if (sb_diag_feeds < 6 && want >= 16u) {
-                    logger_note_kv("sb: feed want", (unsigned long)want);
-                    logger_note_kv("sb: feed lead", (unsigned long)lead);
-                    sb_diag_hex("sb raw pre-xor", sb_snapshot, want);
-                }
                 if (sb_bits == 8 && sb_signed)
                     for (k = 0; k < want; k++) sb_snapshot[k] ^= 0x80u;
-                if (sb_diag_feeds < 6 && want >= 16u) {
-                    sb_diag_hex("sb fed post-xor", sb_snapshot, want);
-                    sb_diag_feeds++;
-                }
-                fed = audio_pcm_feed(sb_snapshot, want);
-                sb_dma_pos        += fed;
-                sb_diag_fed_total += fed;
+                sb_load_fp     = audio_pcm_play(sb_snapshot, want);
+                sb_dma_pos    += want;
+                sb_xfer_total += want;
 
-                /* Advance NTVDM's emulated 8237 current addr/count so a guest
-                 * that POLLS the DMA controller sees the play cursor move. DOOM/
-                 * DMX reads ports 0x02/0x03 (current address) each interrupt to
-                 * pick which block to mix next; b39 proved the count was frozen
-                 * (VDDRequestDMA is inert here, b40: got=0), so DMX re-mixed one
-                 * block forever = chk-a-chk-a. We drive the controller directly
-                 * with VDDSetDMA, the way VDMSound does. The 8237 counts DOWN in
-                 * transfers (bytes for 8-bit ch<4, words for ch>=4); sb_dma_pos
-                 * is our byte cursor and wraps the ring on auto-init, which
-                 * reloads addr/count to base (the correct auto-init behaviour).
-                 * [b42-setdma] */
+                /* advance NTVDM's emulated 8237 so a polling guest (DOOM/DMX
+                 * reads ports 0x02/0x03) tracks the play cursor [b42-setdma] */
                 {
                     VDD_DMA_INFO di;
                     unsigned xfers = (sb_channel >= 4u) ? (sb_dma_pos >> 1)
                                                         : sb_dma_pos;
-                    BOOL ok;
                     di.addr   = (WORD)(sb_base_addr + xfers);
                     di.count  = (WORD)(sb_base_count - xfers);
                     di.page   = (WORD)sb_base_page;
-                    di.status = 0;
-                    di.mode   = 0;
-                    di.mask   = 0;
-                    ok = VDDSetDMA(sb_hvdd, sb_channel,
-                                   VDD_DMA_ADDR | VDD_DMA_COUNT, &di);
-                    if (sb_diag_req < 4) {
-                        logger_note_kv("sb: VDDSetDMA ok",    (unsigned long)ok);
-                        logger_note_kv("sb: VDDSetDMA count", (unsigned long)di.count);
-                        sb_diag_req++;
-                    }
+                    di.status = 0; di.mode = 0; di.mask = 0;
+                    VDDSetDMA(sb_hvdd, sb_channel,
+                              VDD_DMA_ADDR | VDD_DMA_COUNT, &di);
                 }
 
-                /* Fire the completion IRQ every programmed block (sb_block_bytes),
-                 * NOT once per DMA-buffer wrap: the SB raises one IRQ per block,
-                 * and games pack several blocks into one auto-init ring (DOOM:
-                 * 512-byte block inside a 4096-byte ring = 8 IRQs/loop). b36
-                 * showed under-IRQing makes the guest refill late, so its fill
-                 * frontier rode right at our read cursor -> tearing (DOOM fill
-                 * margin ~0). [b37-irqblk] */
-                sb_irq_accum += fed;
-                while (sb_block_bytes && sb_irq_accum >= sb_block_bytes) {
-                    sb_irq_accum -= sb_block_bytes;
+                /* one completion IRQ per DSP block crossed; single-cycle stops
+                 * at the block end (VDMSound HandleAfterTransfer). */
+                overshoot = sb_xfer_total % sb_block_bytes;
+                if (want > overshoot) {
                     sb_post_irq();
-                    if (!sb_autoinit) {     /* single-cycle: one block then stop */
-                        sb_play = 0;
-                        audio_pcm_close();
-                        break;
-                    }
+                    if (!sb_autoinit) { sb_play = 0; audio_pcm_close(); }
                 }
                 if (sb_autoinit && sb_dma_pos >= sb_dma_len)
-                    sb_dma_pos = 0;         /* wrap the physical auto-init ring */
+                    sb_dma_pos = 0;          /* wrap the auto-init ring */
             }
+        }
+
+        /* health log (~1 s of playing ticks) */
+        if (++sb_diag_tick_acc >= 1024u) {
+            WORD qi[16];
+            ZeroMemory(qi, sizeof(qi));
+            VDDQueryDMA(sb_hvdd, sb_channel, qi);
+            logger_note_kv("sb: load fp (256=on target)", (unsigned long)sb_load_fp);
+            logger_note_kv("sb: bytes transferred", (unsigned long)sb_xfer_total);
+            logger_note_kv("sb: irq posts", (unsigned long)sb_irq_posts);
+            logger_note_kv("sb: irq acks", (unsigned long)sb_irq_acks);
+            logger_note_kv("sb: live DMA count", (unsigned long)qi[1]);
+            sb_diag_tick_acc = 0;
         }
     }
     LeaveCriticalSection(&sb_cs);

@@ -130,14 +130,29 @@ static int create_buffer(void)
     return 0;
 }
 
-/* ---- streaming PCM via a looping DirectSound buffer (DS does SRC + mixing) - */
+/* ---- streaming PCM via a big looping DirectSound buffer ------------------
+ * Re-implemented (MIT-clean) from VDMSound's DSoundDevice/WaveOut design: a
+ * ~1.5 s looping buffer kept ~125-250 ms full, with sent/played byte
+ * accounting, a load factor returned to the SB consumer for closed-loop rate
+ * control, a DirectSound play-cursor-jerk correction, and lag recovery (jump
+ * the write cursor forward instead of scribbling on audio already playing).
+ * The SB consumer (sb_module.c) meters how many guest bytes to read per tick
+ * off the wall clock x the programmed byte-rate x (1/load). */
+#define PCM_BUF_MS   1500u   /* ring length (VDMSound BUF_MINLEN)            */
+#define PCM_LEAD_MS  125u    /* target lead / buffer operating range         */
+
 static LPDIRECTSOUNDBUFFER pcm_buf;
 static CRITICAL_SECTION    pcm_lock;
 static volatile LONG       pcm_lock_ready;
-static unsigned            pcm_bytes;   /* ring size */
-static DWORD               pcm_write;   /* our write cursor */
+static unsigned            pcm_len;       /* DS buffer length (bytes)        */
+static DWORD               pcm_pos;       /* our write cursor                */
 static int                 pcm_on;
-static volatile LONG       pcm_underruns; /* play cursor overtook write (b41) */
+static unsigned            pcm_sent;      /* bytes written into the ring     */
+static unsigned            pcm_played;    /* bytes played out by DS          */
+static DWORD               pcm_lastplay;  /* last observed play cursor       */
+static unsigned            pcm_latency;   /* worst-case DS commit length     */
+static unsigned            pcm_low;       /* target buffered bytes (125 ms)  */
+static unsigned            pcm_high;      /* target buffered bytes (250 ms)  */
 
 int audio_pcm_open(unsigned rate, int bits, int channels)
 {
@@ -145,7 +160,9 @@ int audio_pcm_open(unsigned rate, int bits, int channels)
     DSBUFFERDESC desc;
     void *p1 = NULL, *p2 = NULL;
     DWORD b1 = 0, b2 = 0;
-    unsigned sz, align = (unsigned)(channels * bits / 8);
+    unsigned align    = (unsigned)(channels * bits / 8);
+    unsigned byterate = rate * align;
+    unsigned len;
 
     if (ds == NULL || align == 0) return 1;
     if (!InterlockedCompareExchange(&pcm_lock_ready, 1, 1)) return 1;
@@ -156,9 +173,11 @@ int audio_pcm_open(unsigned rate, int bits, int channels)
         pcm_buf->lpVtbl->Release(pcm_buf);
         pcm_buf = NULL;
     }
-    sz = (rate * align) / 8u;            /* ~125 ms ring */
-    if (sz < 4096u) sz = 4096u;
-    sz -= sz % align;
+
+    len  = (byterate / 1000u) * PCM_BUF_MS;          /* ~1.5 s ring */
+    len += align - (len % align);                    /* frame-align */
+    if (len < (unsigned)DSBSIZE_MIN) len = (unsigned)DSBSIZE_MIN;
+    if (len > (unsigned)DSBSIZE_MAX) len = (unsigned)DSBSIZE_MAX;
 
     ZeroMemory(&wfx, sizeof(wfx));
     wfx.wFormatTag      = WAVE_FORMAT_PCM;
@@ -166,12 +185,12 @@ int audio_pcm_open(unsigned rate, int bits, int channels)
     wfx.nSamplesPerSec  = rate;
     wfx.wBitsPerSample  = (WORD)bits;
     wfx.nBlockAlign     = (WORD)align;
-    wfx.nAvgBytesPerSec = rate * align;
+    wfx.nAvgBytesPerSec = byterate;
 
     ZeroMemory(&desc, sizeof(desc));
     desc.dwSize        = sizeof(desc);
     desc.dwFlags       = DSBCAPS_GLOBALFOCUS | DSBCAPS_GETCURRENTPOSITION2;
-    desc.dwBufferBytes = sz;
+    desc.dwBufferBytes = len;
     desc.lpwfxFormat   = &wfx;
 
     if (FAILED(ds->lpVtbl->CreateSoundBuffer(ds, &desc, &pcm_buf, NULL))) {
@@ -179,66 +198,87 @@ int audio_pcm_open(unsigned rate, int bits, int channels)
         LeaveCriticalSection(&pcm_lock);
         return 1;
     }
-    if (SUCCEEDED(pcm_buf->lpVtbl->Lock(pcm_buf, 0, sz, &p1, &b1, &p2, &b2, 0))) {
+    if (SUCCEEDED(pcm_buf->lpVtbl->Lock(pcm_buf, 0, len, &p1, &b1, &p2, &b2, 0))) {
         FillMemory(p1, b1, (bits == 8) ? 0x80 : 0x00);
         if (p2 != NULL && b2 != 0) FillMemory(p2, b2, (bits == 8) ? 0x80 : 0x00);
         pcm_buf->lpVtbl->Unlock(pcm_buf, p1, b1, p2, b2);
     }
-    pcm_bytes = sz;
-    pcm_write = 0;
-    pcm_on    = 1;
-    InterlockedExchange(&pcm_underruns, 0);
+    pcm_len      = len;
+    pcm_pos      = 0;
+    pcm_sent     = 0;
+    pcm_played   = 0;
+    pcm_lastplay = 0;
+    pcm_latency  = 0;
+    pcm_low      = (byterate / 1000u) * PCM_LEAD_MS;  /* 125 ms */
+    pcm_high     = pcm_low * 2u;                       /* 250 ms */
+    pcm_on       = 1;
     pcm_buf->lpVtbl->SetCurrentPosition(pcm_buf, 0);
     pcm_buf->lpVtbl->Play(pcm_buf, 0, 0, DSBPLAY_LOOPING);
     LeaveCriticalSection(&pcm_lock);
     return 0;
 }
 
-unsigned audio_pcm_lead(void)
+/* Write n bytes at our cursor; return the buffer load factor in 8.8 fixed point
+ * (256 = on target): <256 underfull (consumer should speed up), >256 overfull
+ * (slow down). Drives the SB consumer's closed-loop metering. Integer-only
+ * (the DLL is -nostdlib, no soft-float). */
+unsigned audio_pcm_play(const void *data, unsigned n)
 {
-    DWORD play, write;
-    unsigned lead = 0;
-    if (!InterlockedCompareExchange(&pcm_lock_ready, 1, 1)) return 0;
-    EnterCriticalSection(&pcm_lock);
-    if (pcm_on && pcm_buf != NULL &&
-        SUCCEEDED(pcm_buf->lpVtbl->GetCurrentPosition(pcm_buf, &play, &write))) {
-        lead = (pcm_write + pcm_bytes - play) % pcm_bytes;
-        /* If the play cursor has overtaken our write cursor the ring has
-         * underrun: that shows up as a lead near the FULL ring, not ~0 (the
-         * small-lead meter in sb_mix is blind to it). Count it and report 0 so
-         * the feeder tops up immediately instead of coasting a whole ring of
-         * stale data (~the periodic crackle / chk-a-chk-a). [b41] */
-        if (pcm_bytes != 0 && lead > pcm_bytes / 2u) {
-            InterlockedIncrement(&pcm_underruns);
-            lead = 0;
-        }
-    }
-    LeaveCriticalSection(&pcm_lock);
-    return lead;
-}
-
-unsigned audio_pcm_underruns(void)
-{
-    return (unsigned)pcm_underruns;
-}
-
-unsigned audio_pcm_feed(const void *data, unsigned n)
-{
+    DWORD read = 0, write = 0;
+    unsigned commit, buffered, lo, hi, maxlen;
+    unsigned load = 256u;
     void *p1 = NULL, *p2 = NULL;
     DWORD b1 = 0, b2 = 0;
-    unsigned wrote = 0;
-    if (!InterlockedCompareExchange(&pcm_lock_ready, 1, 1)) return 0;
+
+    if (!InterlockedCompareExchange(&pcm_lock_ready, 1, 1)) return 256u;
     EnterCriticalSection(&pcm_lock);
-    if (pcm_on && pcm_buf != NULL && n > 0 &&
-        SUCCEEDED(pcm_buf->lpVtbl->Lock(pcm_buf, pcm_write, n, &p1, &b1, &p2, &b2, 0))) {
-        CopyMemory(p1, data, b1);
+    if (!pcm_on || pcm_buf == NULL || pcm_len == 0 ||
+        FAILED(pcm_buf->lpVtbl->GetCurrentPosition(pcm_buf, &read, &write))) {
+        LeaveCriticalSection(&pcm_lock);
+        return 256u;
+    }
+
+    commit = (pcm_len + write - read) % pcm_len;     /* DS-committed, untouchable */
+    if (commit > pcm_latency) pcm_latency = commit;  /* worst-case latency */
+
+    /* DirectSound play-cursor-jerk workaround: refuse to let the play cursor
+     * appear to jump far forward and then snap back. */
+    if ((unsigned)((pcm_len + read - pcm_lastplay) % pcm_len) > (3u * pcm_len / 4u)) {
+        read   = pcm_lastplay;
+        commit = (pcm_len + write - read) % pcm_len;
+    }
+
+    pcm_played  += (pcm_len + read - pcm_lastplay) % pcm_len;
+    pcm_lastplay = read;
+    buffered = (pcm_sent > pcm_played) ? (pcm_sent - pcm_played) : 0u;
+
+    /* Lag recovery: if we've fallen behind the committed region, jump our write
+     * cursor to a safe spot ahead of the play cursor instead of scribbling on
+     * audio that is already being played. */
+    if (buffered < commit) {
+        pcm_pos  = (read + pcm_latency) % pcm_len;
+        pcm_sent = pcm_played + pcm_latency;
+    }
+
+    maxlen = (n < pcm_len) ? n : pcm_len;
+    if (maxlen > 0 &&
+        SUCCEEDED(pcm_buf->lpVtbl->Lock(pcm_buf, pcm_pos, maxlen,
+                                        &p1, &b1, &p2, &b2, 0))) {
+        if (p1 != NULL) CopyMemory(p1, data, b1);
         if (p2 != NULL && b2 != 0) CopyMemory(p2, (const char *)data + b1, b2);
         pcm_buf->lpVtbl->Unlock(pcm_buf, p1, b1, p2, b2);
-        pcm_write = (pcm_write + n) % pcm_bytes;
-        wrote = n;
+        pcm_buf->lpVtbl->Play(pcm_buf, 0, 0, DSBPLAY_LOOPING);  /* keep looping */
+        pcm_pos   = (pcm_pos + maxlen) % pcm_len;
+        pcm_sent += maxlen;
     }
+
+    lo = (pcm_low  > 2u * pcm_latency) ? pcm_low  : 2u * pcm_latency;
+    hi = (pcm_high > 3u * pcm_latency) ? pcm_high : 3u * pcm_latency;
+    if (lo > 0u && buffered < lo)      load = buffered * 256u / lo;
+    else if (hi > 0u && buffered > hi) load = buffered * 256u / hi;
+
     LeaveCriticalSection(&pcm_lock);
-    return wrote;
+    return load;
 }
 
 void audio_pcm_close(void)

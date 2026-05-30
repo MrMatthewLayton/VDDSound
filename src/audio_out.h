@@ -9,15 +9,14 @@
 int  audio_init(void);
 void audio_shutdown(void);
 
-/* Streaming PCM via a looping DirectSound buffer at the SB's native format/rate
- * (DirectSound does the SRC + mixing). We read the guest buffer LIVE just behind
- * the play cursor (like the hardware DMA), feeding small amounts to hold a short
- * lead. open: create+start (silence). lead: unplayed bytes ahead of the play
- * cursor. feed: append n bytes at our write cursor. close: stop+release. */
+/* Streaming PCM via a big (~1.5 s) looping DirectSound buffer at the SB's native
+ * format/rate (DirectSound does the SRC + mixing). VDMSound-style: the consumer
+ * meters guest bytes off the wall clock and pushes them with audio_pcm_play,
+ * which keeps the ring ~125-250 ms full and returns a load factor (<1 underfull,
+ * >1 overfull, 1 on target) for closed-loop rate control. open: create+start
+ * (silence). play: write n bytes, return load. close: stop+release. */
 int      audio_pcm_open(unsigned rate, int bits, int channels);
-unsigned audio_pcm_lead(void);
-unsigned audio_pcm_feed(const void *data, unsigned n);
+unsigned audio_pcm_play(const void *data, unsigned n);   /* returns load (8.8 fp, 256=on target) */
 void     audio_pcm_close(void);
-unsigned audio_pcm_underruns(void);   /* play-cursor-overtook-write count (diag) */
 
 #endif /* VDDSOUND_AUDIO_OUT_H */
