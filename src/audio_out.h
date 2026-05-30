@@ -9,4 +9,12 @@
 int  audio_init(void);
 void audio_shutdown(void);
 
+/* One-shot PCM via a dedicated DirectSound buffer at the SB's native format/rate
+ * (DirectSound does the sample-rate conversion + mixing, not us). audio_pcm_play
+ * creates+plays the buffer (call from the VDM thread); audio_pcm_done returns 1
+ * once (per play) when it has finished, to time the SB completion IRQ. */
+int  audio_pcm_play(const void *data, unsigned bytes, unsigned rate,
+                    int bits, int channels);
+int  audio_pcm_done(void);
+
 #endif /* VDDSOUND_AUDIO_OUT_H */

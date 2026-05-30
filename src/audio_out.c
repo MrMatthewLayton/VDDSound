@@ -129,9 +129,82 @@ static int create_buffer(void)
     return 0;
 }
 
+/* ---- one-shot PCM secondary buffer (DS does the SRC + mixing) ------------ */
+static LPDIRECTSOUNDBUFFER pcm_buf;
+static CRITICAL_SECTION    pcm_lock;
+static volatile LONG       pcm_lock_ready;
+static int                 pcm_active;
+
+int audio_pcm_play(const void *data, unsigned bytes, unsigned rate,
+                   int bits, int channels)
+{
+    WAVEFORMATEX wfx;
+    DSBUFFERDESC desc;
+    void *p1 = NULL, *p2 = NULL;
+    DWORD b1 = 0, b2 = 0;
+    int rc = 1;
+
+    if (ds == NULL || data == NULL || bytes < 4u) return 1;
+    if (!InterlockedCompareExchange(&pcm_lock_ready, 1, 1)) return 1;
+
+    EnterCriticalSection(&pcm_lock);
+    if (pcm_buf != NULL) {
+        pcm_buf->lpVtbl->Stop(pcm_buf);
+        pcm_buf->lpVtbl->Release(pcm_buf);
+        pcm_buf = NULL;
+    }
+    ZeroMemory(&wfx, sizeof(wfx));
+    wfx.wFormatTag      = WAVE_FORMAT_PCM;
+    wfx.nChannels       = (WORD)channels;
+    wfx.nSamplesPerSec  = rate;
+    wfx.wBitsPerSample  = (WORD)bits;
+    wfx.nBlockAlign     = (WORD)(channels * bits / 8);
+    wfx.nAvgBytesPerSec = rate * wfx.nBlockAlign;
+
+    ZeroMemory(&desc, sizeof(desc));
+    desc.dwSize        = sizeof(desc);
+    desc.dwFlags       = DSBCAPS_GLOBALFOCUS | DSBCAPS_GETCURRENTPOSITION2;
+    desc.dwBufferBytes = bytes;
+    desc.lpwfxFormat   = &wfx;
+
+    if (SUCCEEDED(ds->lpVtbl->CreateSoundBuffer(ds, &desc, &pcm_buf, NULL))) {
+        if (SUCCEEDED(pcm_buf->lpVtbl->Lock(pcm_buf, 0, bytes, &p1, &b1, &p2, &b2, 0))) {
+            CopyMemory(p1, data, b1);
+            if (p2 != NULL && b2 != 0) CopyMemory(p2, (const char *)data + b1, b2);
+            pcm_buf->lpVtbl->Unlock(pcm_buf, p1, b1, p2, b2);
+        }
+        pcm_buf->lpVtbl->Play(pcm_buf, 0, 0, 0);   /* one-shot, no loop */
+        pcm_active = 1;
+        rc = 0;
+    } else {
+        pcm_buf = NULL;
+    }
+    LeaveCriticalSection(&pcm_lock);
+    return rc;
+}
+
+int audio_pcm_done(void)
+{
+    DWORD st;
+    int done = 0;
+    if (!InterlockedCompareExchange(&pcm_lock_ready, 1, 1)) return 0;
+    EnterCriticalSection(&pcm_lock);
+    if (pcm_active && pcm_buf != NULL &&
+        SUCCEEDED(pcm_buf->lpVtbl->GetStatus(pcm_buf, &st)) &&
+        !(st & DSBSTATUS_PLAYING)) {
+        pcm_active = 0;
+        done = 1;
+    }
+    LeaveCriticalSection(&pcm_lock);
+    return done;
+}
+
 int audio_init(void)
 {
     DWORD tid;
+
+    InitializeCriticalSection(&pcm_lock);
+    InterlockedExchange(&pcm_lock_ready, 1);
 
     if (FAILED(DirectSoundCreate(NULL, &ds, NULL))) {
         return 1;

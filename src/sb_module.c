@@ -90,8 +90,8 @@ static BYTE     sb_snapshot[131072];   /* private copy of the guest DMA buffer *
 static int16_t  sb_stage[SB_STAGE_RAW_BYTES * 2]; /* decoded stereo frames */
 static unsigned sb_stage_head, sb_stage_pos;
 static int      sb_have_cur;
-static int      sb_cur_l, sb_cur_r, sb_nxt_l, sb_nxt_r;
-static unsigned sb_phase;          /* 16.16 fractional position cur->nxt */
+static int      sb_p0l, sb_p0r, sb_p1l, sb_p1r, sb_p2l, sb_p2r, sb_p3l, sb_p3r;
+static unsigned sb_phase;          /* 16.16 fractional position p1->p2 */
 static int      sb_diag_pull_logged;   /* DIAG(b20): one-shot render-pull trace */
 
 /* ------------------------------------------------------------------------- */
@@ -229,6 +229,26 @@ static void sb_start(int bits, int stereo, int sgnd, unsigned channel,
     if (!sb_dma_ptr) {
         sb_play = 0;
         logger_note("sb: no DMA pointer - not playing");
+    } else {
+        if (sb_dma_len >= 544u) {   /* DIAG(b33): raw waveform window @ offset 512 */
+            unsigned k;
+            for (k = 0; k < 8u; k++) {
+                unsigned o = 512u + k * 4u;
+                logger_note_kv("sb: wav",
+                    (unsigned long)(sb_snapshot[o] | (sb_snapshot[o+1] << 8)
+                    | ((unsigned long)sb_snapshot[o+2] << 16)
+                    | ((unsigned long)sb_snapshot[o+3] << 24)));
+            }
+        }
+        /* Hand the PCM to DirectSound at its native format/rate - DS does the
+         * SRC + mixing. DS 8-bit is unsigned, so flip signed snapshots in place;
+         * 16-bit is signed and passes through. */
+        if (sb_bits == 8 && sb_signed) {
+            unsigned i;
+            for (i = 0; i < sb_dma_len; i++) sb_snapshot[i] ^= 0x80u;
+        }
+        audio_pcm_play(sb_snapshot, sb_dma_len, sb_rate, sb_bits,
+                       sb_stereo ? 2 : 1);
     }
 }
 
@@ -491,6 +511,17 @@ static int sb_next_frame(int *l, int *r)
     return 1;
 }
 
+/* Catmull-Rom cubic between p1 and p2 (p0,p3 the neighbours), f = 16-bit frac.
+ * out = p1 + 0.5*t*( (p2-p0) + t*( (2p0-5p1+4p2-p3) + t*(3(p1-p2)+p3-p0) ) ). */
+static int sb_cubic(int p0, int p1, int p2, int p3, int f)
+{
+    int64_t a = 3 * (p1 - p2) + p3 - p0;
+    int64_t b = 2 * p0 - 5 * p1 + 4 * p2 - p3;
+    int64_t inner = b + ((f * a) >> 16);
+    inner = (int64_t)(p2 - p0) + ((f * inner) >> 16);
+    return p1 + (int)((f * inner) >> 17);
+}
+
 void sb_mix(int16_t *buf, unsigned frames)
 {
     unsigned step, i;
@@ -498,23 +529,39 @@ void sb_mix(int16_t *buf, unsigned frames)
     if (!InterlockedCompareExchange(&sb_cs_ready, 1, 1)) return;
     EnterCriticalSection(&sb_cs);
 
+    /* PCM plays through a dedicated DirectSound buffer (DS does SRC + mixing);
+     * here we only watch it finish, to time the SB completion IRQ. The old
+     * in-driver resampler below is now unreachable (kept to avoid churn). */
+    if (sb_play && !sb_paused && audio_pcm_done()) {
+        sb_post_irq();
+        if (sb_autoinit)
+            audio_pcm_play(sb_snapshot, sb_dma_len, sb_rate, sb_bits,
+                           sb_stereo ? 2 : 1);
+        else
+            sb_play = 0;
+    }
+    LeaveCriticalSection(&sb_cs);
+    return;
+
     if (!sb_play || sb_paused) { LeaveCriticalSection(&sb_cs); return; }
 
     step = (sb_rate << 16) / AUDIO_SAMPLE_RATE;
     if (step == 0) step = 1;
 
     if (!sb_have_cur) {
-        if (!sb_next_frame(&sb_cur_l, &sb_cur_r)) { LeaveCriticalSection(&sb_cs); return; }
-        if (!sb_next_frame(&sb_nxt_l, &sb_nxt_r)) { sb_nxt_l = sb_cur_l; sb_nxt_r = sb_cur_r; }
+        /* prime the 4-sample window; interpolation is between p1 and p2. */
+        if (!sb_next_frame(&sb_p1l, &sb_p1r)) { LeaveCriticalSection(&sb_cs); return; }
+        sb_p0l = sb_p1l; sb_p0r = sb_p1r;
+        if (!sb_next_frame(&sb_p2l, &sb_p2r)) { sb_p2l = sb_p1l; sb_p2r = sb_p1r; }
+        if (!sb_next_frame(&sb_p3l, &sb_p3r)) { sb_p3l = sb_p2l; sb_p3r = sb_p2r; }
         sb_have_cur = 1;
         sb_phase = 0;
     }
 
     for (i = 0; i < frames; i++) {
         int f = (int)(sb_phase & 0xFFFFu);
-        /* 64-bit intermediate: (17-bit delta) * (16-bit frac) overflows int32. */
-        int l = sb_cur_l + (int)(((int64_t)(sb_nxt_l - sb_cur_l) * f) >> 16);
-        int r = sb_cur_r + (int)(((int64_t)(sb_nxt_r - sb_cur_r) * f) >> 16);
+        int l = sb_cubic(sb_p0l, sb_p1l, sb_p2l, sb_p3l, f);
+        int r = sb_cubic(sb_p0r, sb_p1r, sb_p2r, sb_p3r, f);
 
         if (sb_speaker) {
             int ml = (int)buf[2 * i]     + l;
@@ -526,9 +573,10 @@ void sb_mix(int16_t *buf, unsigned frames)
         sb_phase += step;
         while (sb_phase >= 0x10000u) {
             sb_phase -= 0x10000u;
-            sb_cur_l = sb_nxt_l; sb_cur_r = sb_nxt_r;
-            if (!sb_next_frame(&sb_nxt_l, &sb_nxt_r)) {
-                sb_nxt_l = sb_cur_l; sb_nxt_r = sb_cur_r;
+            sb_p0l = sb_p1l; sb_p1l = sb_p2l; sb_p2l = sb_p3l;
+            sb_p0r = sb_p1r; sb_p1r = sb_p2r; sb_p2r = sb_p3r;
+            if (!sb_next_frame(&sb_p3l, &sb_p3r)) {
+                sb_p3l = sb_p2l; sb_p3r = sb_p2r;
                 if (!sb_play) { LeaveCriticalSection(&sb_cs); return; }
                 /* else: transient guest underrun - hold last sample. */
             }
