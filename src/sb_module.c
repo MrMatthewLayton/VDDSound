@@ -80,6 +80,7 @@ static const BYTE *sb_dma_ptr;     /* host pointer to the guest DMA buffer */
 static unsigned    sb_dma_len;     /* buffer length in bytes */
 static unsigned    sb_dma_pos;     /* play cursor within the buffer */
 static unsigned    sb_irq_accum;   /* bytes fed since the last block-completion IRQ */
+static unsigned    sb_gate_wait;   /* render ticks spent waiting for a block-IRQ ack */
 static unsigned    sb_base_addr;   /* 8237 base address register at transfer start */
 static unsigned    sb_base_count;  /* 8237 base count (transfers-1) at transfer start */
 static unsigned    sb_base_page;   /* 8237 page register at transfer start */
@@ -188,6 +189,7 @@ static void sb_start(int bits, int stereo, int sgnd, unsigned channel,
     sb_stage_head  = sb_stage_pos = 0;
     sb_play        = 1;
     sb_irq_accum   = 0;
+    sb_gate_wait   = 0;
     InterlockedExchange(&sb_irq_posts, 0);   /* DIAG(b38) */
     InterlockedExchange(&sb_irq_acks, 0);
     sb_diag_pull_logged = 0;
@@ -574,7 +576,7 @@ void sb_mix(int16_t *buf, unsigned frames)
      * (kept so its helpers still compile). */
     if (sb_play && !sb_paused && sb_dma_ptr) {
         unsigned frame  = (unsigned)(sb_bits / 8) * (sb_stereo ? 2u : 1u);
-        unsigned target = frame ? (sb_rate * frame) / 50u : 0u;   /* ~20 ms */
+        unsigned target = frame ? (sb_rate * frame) / 25u : 0u;   /* ~40 ms */
         unsigned lead   = audio_pcm_lead();
 
         /* DIAG(b35): lead/pacing health. If the lead frequently hits ~0 the DS
@@ -624,12 +626,25 @@ void sb_mix(int16_t *buf, unsigned frames)
             sb_diag_underruns = 0;
         }
 
-        if (frame && lead < target) {
+        /* SB16 ACK-gate (b43): don't consume the next block until the guest has
+         * acked the previous block's IRQ (it clears the pending flag by reading
+         * 0x22E/0x22F). The trace showed irq posts running ~600 ms ahead of acks
+         * because we post on FEED (far ahead of playback): DOOM then refilled
+         * each block long after we'd already re-read it stale = chk-a-chk-a.
+         * Gating caps the outstanding IRQ pipeline at one block so refills stay
+         * locked to our reads (VDMSound's back-pressure model). Safety: feed
+         * anyway after ~64 ticks so a guest that stops acking can't wedge us into
+         * permanent silence. */
+        if (!(sb_bits < 16 ? sb_irq8_pending : sb_irq16_pending)) sb_gate_wait = 0;
+        else sb_gate_wait++;
+
+        if (frame && lead < target && (sb_gate_wait == 0 || sb_gate_wait >= 64u)) {
             unsigned want  = target - lead;
             unsigned avail = sb_dma_len - sb_dma_pos;
             unsigned k, fed;
             if (want > avail)               want = avail;
             if (want > sizeof(sb_snapshot)) want = sizeof(sb_snapshot);
+            if (want > sb_block_bytes)      want = sb_block_bytes; /* <=1 IRQ/feed */
             want -= want % frame;
             if (want > 0) {
                 CopyMemory(sb_snapshot, sb_dma_ptr + sb_dma_pos, want);
