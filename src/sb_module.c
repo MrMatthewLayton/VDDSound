@@ -593,6 +593,20 @@ void sb_mix(int16_t *buf, unsigned frames)
             logger_note_kv("sb: fill margin ahead", (unsigned long)(frontier - sb_dma_pos));
             logger_note_kv("sb: irq posts (cumulative)", (unsigned long)sb_irq_posts);
             logger_note_kv("sb: irq acks (cumulative)", (unsigned long)sb_irq_acks);
+            /* DIAG(b39): does NTVDM's emulated DMA cursor advance? We never call
+             * VDDRequestDMA, so the 8237 count may be frozen at its initial
+             * value. If it DECREASES over windows, NTVDM is pacing the channel
+             * and we can sync our read to it (the guest's own clock) to stop the
+             * tearing; if frozen, we must drive the DMA to advance it. Safe from
+             * the render thread - we already raise IRQs (call_ica_hw_interrupt)
+             * from here. */
+            {
+                WORD qi[16];
+                ZeroMemory(qi, sizeof(qi));
+                VDDQueryDMA(sb_hvdd, sb_channel, qi);
+                logger_note_kv("sb: live DMA count", (unsigned long)qi[1]);
+                logger_note_kv("sb: live DMA addr", (unsigned long)qi[0]);
+            }
             sb_diag_tick_acc  = 0;
             sb_diag_min_lead  = 0xFFFFFFFFu;
             sb_diag_underruns = 0;
@@ -607,13 +621,18 @@ void sb_mix(int16_t *buf, unsigned frames)
             want -= want % frame;
             if (want > 0) {
                 CopyMemory(sb_snapshot, sb_dma_ptr + sb_dma_pos, want);
-                if (sb_bits == 8 && sb_signed)
-                    for (k = 0; k < want; k++) sb_snapshot[k] ^= 0x80u;
-                /* DIAG(b35): show the actual bytes we feed for the first feeds. */
+                /* DIAG(b35/b39): raw (pre-xor) then fed (post-xor) bytes. Raw
+                 * centered on 0x80 = unsigned source; centered on 0x00 = signed
+                 * source. Lets us read signedness off the data, not the guess. */
                 if (sb_diag_feeds < 6 && want >= 16u) {
                     logger_note_kv("sb: feed want", (unsigned long)want);
                     logger_note_kv("sb: feed lead", (unsigned long)lead);
-                    sb_diag_hex("sb fed", sb_snapshot, want);
+                    sb_diag_hex("sb raw pre-xor", sb_snapshot, want);
+                }
+                if (sb_bits == 8 && sb_signed)
+                    for (k = 0; k < want; k++) sb_snapshot[k] ^= 0x80u;
+                if (sb_diag_feeds < 6 && want >= 16u) {
+                    sb_diag_hex("sb fed post-xor", sb_snapshot, want);
                     sb_diag_feeds++;
                 }
                 fed = audio_pcm_feed(sb_snapshot, want);
