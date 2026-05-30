@@ -595,6 +595,7 @@ void sb_mix(int16_t *buf, unsigned frames)
             logger_note_kv("sb: fill margin ahead", (unsigned long)(frontier - sb_dma_pos));
             logger_note_kv("sb: irq posts (cumulative)", (unsigned long)sb_irq_posts);
             logger_note_kv("sb: irq acks (cumulative)", (unsigned long)sb_irq_acks);
+            logger_note_kv("sb: DS underruns (overtake)", (unsigned long)audio_pcm_underruns());
             /* DIAG(b39): does NTVDM's emulated DMA cursor advance? We never call
              * VDDRequestDMA, so the 8237 count may be frozen at its initial
              * value. If it DECREASES over windows, NTVDM is pacing the channel

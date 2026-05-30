@@ -137,6 +137,7 @@ static volatile LONG       pcm_lock_ready;
 static unsigned            pcm_bytes;   /* ring size */
 static DWORD               pcm_write;   /* our write cursor */
 static int                 pcm_on;
+static volatile LONG       pcm_underruns; /* play cursor overtook write (b41) */
 
 int audio_pcm_open(unsigned rate, int bits, int channels)
 {
@@ -186,6 +187,7 @@ int audio_pcm_open(unsigned rate, int bits, int channels)
     pcm_bytes = sz;
     pcm_write = 0;
     pcm_on    = 1;
+    InterlockedExchange(&pcm_underruns, 0);
     pcm_buf->lpVtbl->SetCurrentPosition(pcm_buf, 0);
     pcm_buf->lpVtbl->Play(pcm_buf, 0, 0, DSBPLAY_LOOPING);
     LeaveCriticalSection(&pcm_lock);
@@ -199,10 +201,25 @@ unsigned audio_pcm_lead(void)
     if (!InterlockedCompareExchange(&pcm_lock_ready, 1, 1)) return 0;
     EnterCriticalSection(&pcm_lock);
     if (pcm_on && pcm_buf != NULL &&
-        SUCCEEDED(pcm_buf->lpVtbl->GetCurrentPosition(pcm_buf, &play, &write)))
+        SUCCEEDED(pcm_buf->lpVtbl->GetCurrentPosition(pcm_buf, &play, &write))) {
         lead = (pcm_write + pcm_bytes - play) % pcm_bytes;
+        /* If the play cursor has overtaken our write cursor the ring has
+         * underrun: that shows up as a lead near the FULL ring, not ~0 (the
+         * small-lead meter in sb_mix is blind to it). Count it and report 0 so
+         * the feeder tops up immediately instead of coasting a whole ring of
+         * stale data (~the periodic crackle / chk-a-chk-a). [b41] */
+        if (pcm_bytes != 0 && lead > pcm_bytes / 2u) {
+            InterlockedIncrement(&pcm_underruns);
+            lead = 0;
+        }
+    }
     LeaveCriticalSection(&pcm_lock);
     return lead;
+}
+
+unsigned audio_pcm_underruns(void)
+{
+    return (unsigned)pcm_underruns;
 }
 
 unsigned audio_pcm_feed(const void *data, unsigned n)
@@ -252,6 +269,33 @@ int audio_init(void)
         /* Fall back to a normal cooperative level if PRIORITY is refused. */
         ds->lpVtbl->SetCooperativeLevel(ds, GetDesktopWindow(), DSSCL_NORMAL);
     }
+
+    /* Set the primary buffer to 48 kHz/16/stereo so DirectSound mixes our
+     * secondary buffers at full rate. The default primary is often 22050 Hz,
+     * which forces an ugly resample of the 6024/11025 Hz PCM (a real crackle
+     * source). Best-effort: needs DSSCL_PRIORITY (set above); ignore failure
+     * and the SetFormat persists after we release the primary. [b41] */
+    {
+        LPDIRECTSOUNDBUFFER prim = NULL;
+        DSBUFFERDESC pd;
+        ZeroMemory(&pd, sizeof(pd));
+        pd.dwSize  = sizeof(pd);
+        pd.dwFlags = DSBCAPS_PRIMARYBUFFER;
+        if (SUCCEEDED(ds->lpVtbl->CreateSoundBuffer(ds, &pd, &prim, NULL)) &&
+            prim != NULL) {
+            WAVEFORMATEX pf;
+            ZeroMemory(&pf, sizeof(pf));
+            pf.wFormatTag      = WAVE_FORMAT_PCM;
+            pf.nChannels       = 2;
+            pf.nSamplesPerSec  = AUDIO_SAMPLE_RATE;
+            pf.wBitsPerSample  = 16;
+            pf.nBlockAlign     = 4;
+            pf.nAvgBytesPerSec = AUDIO_SAMPLE_RATE * 4u;
+            prim->lpVtbl->SetFormat(prim, &pf);
+            prim->lpVtbl->Release(prim);
+        }
+    }
+
     if (create_buffer() != 0) {
         ds->lpVtbl->Release(ds);
         ds = NULL;

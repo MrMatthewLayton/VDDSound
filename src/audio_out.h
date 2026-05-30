@@ -18,5 +18,6 @@ int      audio_pcm_open(unsigned rate, int bits, int channels);
 unsigned audio_pcm_lead(void);
 unsigned audio_pcm_feed(const void *data, unsigned n);
 void     audio_pcm_close(void);
+unsigned audio_pcm_underruns(void);   /* play-cursor-overtook-write count (diag) */
 
 #endif /* VDDSOUND_AUDIO_OUT_H */
