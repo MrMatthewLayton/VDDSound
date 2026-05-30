@@ -94,6 +94,13 @@ static int      sb_p0l, sb_p0r, sb_p1l, sb_p1r, sb_p2l, sb_p2r, sb_p3l, sb_p3r;
 static unsigned sb_phase;          /* 16.16 fractional position p1->p2 */
 static int      sb_diag_pull_logged;   /* DIAG(b20): one-shot render-pull trace */
 
+/* ---- b35 feed-path diagnostics (render thread only) --------------------- */
+static int      sb_diag_feeds;       /* fed-byte hex dumps emitted this transfer */
+static unsigned sb_diag_min_lead;    /* min lead (bytes) seen this window */
+static unsigned sb_diag_underruns;   /* ticks the lead hit ~0 mid-stream */
+static unsigned sb_diag_tick_acc;    /* playing ticks since last health log */
+static unsigned sb_diag_fed_total;   /* total bytes fed to DS this transfer */
+
 /* ------------------------------------------------------------------------- */
 
 static void sb_fifo_clear(void) { sb_fifo_head = sb_fifo_tail = 0; }
@@ -173,6 +180,11 @@ static void sb_start(int bits, int stereo, int sgnd, unsigned channel,
     sb_stage_head  = sb_stage_pos = 0;
     sb_play        = 1;
     sb_diag_pull_logged = 0;
+    sb_diag_feeds     = 0;
+    sb_diag_min_lead  = 0xFFFFFFFFu;
+    sb_diag_underruns = 0;
+    sb_diag_tick_acc  = 0;
+    sb_diag_fed_total = 0;
     logger_note_kv("sb: dma start, rate", (unsigned long)sb_rate);
     logger_note_kv("sb: dma start, bytes", (unsigned long)sb_block_bytes);
     logger_note_kv("sb: start bits", (unsigned long)sb_bits);
@@ -494,6 +506,29 @@ static int sb_cubic(int p0, int p1, int p2, int p3, int f)
     return p1 + (int)((f * inner) >> 17);
 }
 
+/* DIAG(b35): dump up to 32 bytes as hex (the bytes we actually feed to
+ * DirectSound, post signed->unsigned convert). Smooth ramps => the bug is in
+ * the DS streaming-buffer mechanics; jagged garbage => the bug is upstream in
+ * how we read/convert the guest buffer. CRT-free hand-rolled formatting. */
+static void sb_diag_hex(const char *tag, const BYTE *p, unsigned n)
+{
+    static const char hexd[] = "0123456789ABCDEF";
+    char line[160];
+    int pos = 0;
+    unsigned i;
+    while (*tag && pos < 28) line[pos++] = *tag++;
+    line[pos++] = ':';
+    line[pos++] = ' ';
+    if (n > 32u) n = 32u;
+    for (i = 0; i < n; i++) {
+        line[pos++] = hexd[(p[i] >> 4) & 0xFu];
+        line[pos++] = hexd[p[i] & 0xFu];
+        line[pos++] = ' ';
+    }
+    line[pos] = '\0';
+    logger_note(line);
+}
+
 void sb_mix(int16_t *buf, unsigned frames)
 {
     unsigned step, i;
@@ -509,10 +544,25 @@ void sb_mix(int16_t *buf, unsigned frames)
         unsigned frame  = (unsigned)(sb_bits / 8) * (sb_stereo ? 2u : 1u);
         unsigned target = frame ? (sb_rate * frame) / 50u : 0u;   /* ~20 ms */
         unsigned lead   = audio_pcm_lead();
+
+        /* DIAG(b35): lead/pacing health. If the lead frequently hits ~0 the DS
+         * play cursor is lapping our writes (underrun) - that would BE the
+         * crackle. Logged once per ~1s of playing ticks. */
+        if (lead < sb_diag_min_lead) sb_diag_min_lead = lead;
+        if (frame && lead < frame && sb_diag_fed_total > 0u) sb_diag_underruns++;
+        if (++sb_diag_tick_acc >= 1024u) {
+            logger_note_kv("sb: min lead bytes /1k ticks", (unsigned long)sb_diag_min_lead);
+            logger_note_kv("sb: lead underruns /1k ticks", (unsigned long)sb_diag_underruns);
+            logger_note_kv("sb: target lead bytes", (unsigned long)target);
+            sb_diag_tick_acc  = 0;
+            sb_diag_min_lead  = 0xFFFFFFFFu;
+            sb_diag_underruns = 0;
+        }
+
         if (frame && lead < target) {
             unsigned want  = target - lead;
             unsigned avail = sb_dma_len - sb_dma_pos;
-            unsigned k;
+            unsigned k, fed;
             if (want > avail)               want = avail;
             if (want > sizeof(sb_snapshot)) want = sizeof(sb_snapshot);
             want -= want % frame;
@@ -520,7 +570,17 @@ void sb_mix(int16_t *buf, unsigned frames)
                 CopyMemory(sb_snapshot, sb_dma_ptr + sb_dma_pos, want);
                 if (sb_bits == 8 && sb_signed)
                     for (k = 0; k < want; k++) sb_snapshot[k] ^= 0x80u;
-                sb_dma_pos += audio_pcm_feed(sb_snapshot, want);
+                /* DIAG(b35): show the actual bytes we feed for the first dozen
+                 * sizable feeds. */
+                if (sb_diag_feeds < 12 && want >= 16u) {
+                    logger_note_kv("sb: feed want", (unsigned long)want);
+                    logger_note_kv("sb: feed lead", (unsigned long)lead);
+                    sb_diag_hex("sb fed", sb_snapshot, want);
+                    sb_diag_feeds++;
+                }
+                fed = audio_pcm_feed(sb_snapshot, want);
+                sb_dma_pos        += fed;
+                sb_diag_fed_total += fed;
             }
         }
         if (sb_dma_pos >= sb_dma_len) {      /* whole transfer fed */
