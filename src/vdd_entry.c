@@ -121,7 +121,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID reserved)
         hVdd = (HANDLE)hinstDLL;
 
         logger_init();
-        logger_note("attach: vddsound build [b36-fillfront]");
+        logger_note("attach: vddsound build [b37-irqblk]");
         /* Pin ntvdm.exe to one CPU. NTVDM's PIT/timer emulation reads host
          * timing that is unstable across cores (unsynchronised TSCs, SpeedStep)
          * on multi-core machines, which makes DOS programs that time themselves

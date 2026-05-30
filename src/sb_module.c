@@ -79,6 +79,7 @@ static unsigned sb_block_bytes;    /* DSP-command block length (cross-check) */
 static const BYTE *sb_dma_ptr;     /* host pointer to the guest DMA buffer */
 static unsigned    sb_dma_len;     /* buffer length in bytes */
 static unsigned    sb_dma_pos;     /* play cursor within the buffer */
+static unsigned    sb_irq_accum;   /* bytes fed since the last block-completion IRQ */
 
 /* ---- IRQ flags (atomic; render sets, VDM acks) -------------------------- */
 static volatile LONG sb_irq8_pending;
@@ -179,6 +180,7 @@ static void sb_start(int bits, int stereo, int sgnd, unsigned channel,
     sb_phase       = 0;
     sb_stage_head  = sb_stage_pos = 0;
     sb_play        = 1;
+    sb_irq_accum   = 0;
     sb_diag_pull_logged = 0;
     sb_diag_feeds     = 0;
     sb_diag_min_lead  = 0xFFFFFFFFu;
@@ -586,8 +588,7 @@ void sb_mix(int16_t *buf, unsigned frames)
                 CopyMemory(sb_snapshot, sb_dma_ptr + sb_dma_pos, want);
                 if (sb_bits == 8 && sb_signed)
                     for (k = 0; k < want; k++) sb_snapshot[k] ^= 0x80u;
-                /* DIAG(b35): show the actual bytes we feed for the first dozen
-                 * sizable feeds. */
+                /* DIAG(b35): show the actual bytes we feed for the first feeds. */
                 if (sb_diag_feeds < 6 && want >= 16u) {
                     logger_note_kv("sb: feed want", (unsigned long)want);
                     logger_note_kv("sb: feed lead", (unsigned long)lead);
@@ -597,12 +598,27 @@ void sb_mix(int16_t *buf, unsigned frames)
                 fed = audio_pcm_feed(sb_snapshot, want);
                 sb_dma_pos        += fed;
                 sb_diag_fed_total += fed;
+
+                /* Fire the completion IRQ every programmed block (sb_block_bytes),
+                 * NOT once per DMA-buffer wrap: the SB raises one IRQ per block,
+                 * and games pack several blocks into one auto-init ring (DOOM:
+                 * 512-byte block inside a 4096-byte ring = 8 IRQs/loop). b36
+                 * showed under-IRQing makes the guest refill late, so its fill
+                 * frontier rode right at our read cursor -> tearing (DOOM fill
+                 * margin ~0). [b37-irqblk] */
+                sb_irq_accum += fed;
+                while (sb_block_bytes && sb_irq_accum >= sb_block_bytes) {
+                    sb_irq_accum -= sb_block_bytes;
+                    sb_post_irq();
+                    if (!sb_autoinit) {     /* single-cycle: one block then stop */
+                        sb_play = 0;
+                        audio_pcm_close();
+                        break;
+                    }
+                }
+                if (sb_autoinit && sb_dma_pos >= sb_dma_len)
+                    sb_dma_pos = 0;         /* wrap the physical auto-init ring */
             }
-        }
-        if (sb_dma_pos >= sb_dma_len) {      /* whole transfer fed */
-            sb_post_irq();
-            if (sb_autoinit) sb_dma_pos = 0;            /* re-read refilled guest */
-            else { sb_play = 0; audio_pcm_close(); }
         }
     }
     LeaveCriticalSection(&sb_cs);
