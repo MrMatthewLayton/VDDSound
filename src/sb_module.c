@@ -103,6 +103,7 @@ static unsigned sb_diag_min_lead;    /* min lead (bytes) seen this window */
 static unsigned sb_diag_underruns;   /* ticks the lead hit ~0 mid-stream */
 static unsigned sb_diag_tick_acc;    /* playing ticks since last health log */
 static unsigned sb_diag_fed_total;   /* total bytes fed to DS this transfer */
+static int      sb_diag_req;         /* VDDRequestDMA return dumps emitted */
 
 /* ------------------------------------------------------------------------- */
 
@@ -192,6 +193,7 @@ static void sb_start(int bits, int stereo, int sgnd, unsigned channel,
     sb_diag_underruns = 0;
     sb_diag_tick_acc  = 0;
     sb_diag_fed_total = 0;
+    sb_diag_req       = 0;
     logger_note_kv("sb: dma start, rate", (unsigned long)sb_rate);
     logger_note_kv("sb: dma start, bytes", (unsigned long)sb_block_bytes);
     logger_note_kv("sb: start bits", (unsigned long)sb_bits);
@@ -638,6 +640,26 @@ void sb_mix(int16_t *buf, unsigned frames)
                 fed = audio_pcm_feed(sb_snapshot, want);
                 sb_dma_pos        += fed;
                 sb_diag_fed_total += fed;
+
+                /* Drive NTVDM's 8237 so its DMA count advances with playback.
+                 * b39 showed the count frozen at its initial value (we never
+                 * call VDDRequestDMA); DOOM's library polls the count to track
+                 * position, so a frozen count desyncs its mixer -> chk-a-chk-a.
+                 * Advance it by what we consumed (discard the copy; the audio
+                 * still comes from MGetVdmPointer). Auto-init only, so the
+                 * single-cycle path (Skyroads, plays correct sounds) is left
+                 * alone. Return value logged - a prior attempt returned 0, so we
+                 * confirm whether it transfers this time. [b40-drivedma] */
+                if (fed > 0 && sb_autoinit) {
+                    ULONG req = (fed > sizeof(sb_raw)) ? (ULONG)sizeof(sb_raw)
+                                                       : (ULONG)fed;
+                    ULONG got = VDDRequestDMA(sb_hvdd, sb_channel, sb_raw, req);
+                    if (sb_diag_req < 6) {
+                        logger_note_kv("sb: VDDRequestDMA asked", (unsigned long)req);
+                        logger_note_kv("sb: VDDRequestDMA got",   (unsigned long)got);
+                        sb_diag_req++;
+                    }
+                }
 
                 /* Fire the completion IRQ every programmed block (sb_block_bytes),
                  * NOT once per DMA-buffer wrap: the SB raises one IRQ per block,
