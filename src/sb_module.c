@@ -84,6 +84,8 @@ static unsigned    sb_irq_accum;   /* bytes fed since the last block-completion 
 /* ---- IRQ flags (atomic; render sets, VDM acks) -------------------------- */
 static volatile LONG sb_irq8_pending;
 static volatile LONG sb_irq16_pending;
+static volatile LONG sb_irq_posts;   /* DIAG(b38): IRQs we raised this transfer */
+static volatile LONG sb_irq_acks;    /* DIAG(b38): guest reads of 0x22E (8-bit ack) */
 
 /* ---- resampler + decode staging (render thread only) -------------------- */
 static BYTE     sb_raw[SB_STAGE_RAW_BYTES];
@@ -146,6 +148,7 @@ static void sb_post_irq(void)
     if (sb_bits == 16) InterlockedExchange(&sb_irq16_pending, 1);
     else               InterlockedExchange(&sb_irq8_pending, 1);
     call_ica_hw_interrupt(0, SB_IRQ, 1);
+    InterlockedIncrement(&sb_irq_posts);   /* DIAG(b38) */
 }
 
 /* SB 8-bit PCM signedness is not conveyed by the classic DMA commands and games
@@ -181,6 +184,8 @@ static void sb_start(int bits, int stereo, int sgnd, unsigned channel,
     sb_stage_head  = sb_stage_pos = 0;
     sb_play        = 1;
     sb_irq_accum   = 0;
+    InterlockedExchange(&sb_irq_posts, 0);   /* DIAG(b38) */
+    InterlockedExchange(&sb_irq_acks, 0);
     sb_diag_pull_logged = 0;
     sb_diag_feeds     = 0;
     sb_diag_min_lead  = 0xFFFFFFFFu;
@@ -266,6 +271,19 @@ static int dsp_arg_count(BYTE c)
 
 static void dsp_execute(BYTE cmd, const BYTE *a)
 {
+    /* DIAG(b38): log the raw command + arg bytes for every DMA-start command so
+     * we can see EXACTLY what the guest programmed - the SB16 mode byte (arg0,
+     * bit5=stereo bit4=signed) and the SB Pro mixer-0x0E stereo bit. DOOM's
+     * chk-a-chk-a is most likely a stereo misdetect: decoding mono as stereo
+     * makes us read the guest buffer at 2x its fill rate (perpetual tear). */
+    if (cmd == 0x14 || cmd == 0x91 || cmd == 0x1C || cmd == 0x90 ||
+        (cmd >= 0xB0 && cmd <= 0xCF)) {
+        logger_note_kv("sb: DSP cmd", (unsigned long)cmd);
+        logger_note_kv("sb:   arg0 (SB16 mode)", (unsigned long)a[0]);
+        logger_note_kv("sb:   arg1", (unsigned long)a[1]);
+        logger_note_kv("sb:   arg2", (unsigned long)a[2]);
+        logger_note_kv("sb:   mixer 0x0E", (unsigned long)mixer_regs[0x0E]);
+    }
     switch (cmd) {
     case 0xE1:                              /* DSP version */
         sb_fifo_push(SB_DSP_MAJOR);
@@ -395,6 +413,7 @@ VOID WINAPI sb_inb(WORD iport, PBYTE data)
         break;
     case 0x0E: /* 0x22E read-buffer status (bit7 = data avail) + 8-bit IRQ ack */
         InterlockedExchange(&sb_irq8_pending, 0);
+        InterlockedIncrement(&sb_irq_acks);   /* DIAG(b38) */
         *data = sb_fifo_empty() ? (BYTE)0x7F : (BYTE)0xFF;
         break;
     case 0x0F: /* 0x22F 16-bit IRQ acknowledge */
@@ -572,6 +591,8 @@ void sb_mix(int16_t *buf, unsigned frames)
             logger_note_kv("sb: read pos", (unsigned long)sb_dma_pos);
             logger_note_kv("sb: fill frontier", (unsigned long)frontier);
             logger_note_kv("sb: fill margin ahead", (unsigned long)(frontier - sb_dma_pos));
+            logger_note_kv("sb: irq posts (cumulative)", (unsigned long)sb_irq_posts);
+            logger_note_kv("sb: irq acks (cumulative)", (unsigned long)sb_irq_acks);
             sb_diag_tick_acc  = 0;
             sb_diag_min_lead  = 0xFFFFFFFFu;
             sb_diag_underruns = 0;
