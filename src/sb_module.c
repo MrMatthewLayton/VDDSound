@@ -52,7 +52,7 @@
 /* DIAG(b47): capture the exact bytes we feed to DirectSound (post-convert) to
  * C:\vddsound\dump.wav so it can be played back to SEE what we're reading -
  * noise = wrong memory, glitchy/repeating = tearing, wrong speed = stride. */
-#define SB_WAV_DUMP 1
+#define SB_WAV_DUMP 0
 
 /* ---- detection FIFO (VDM thread only) ----------------------------------- */
 static BYTE     sb_fifo[SB_FIFO_SIZE];
@@ -88,6 +88,7 @@ static unsigned sb_block_bytes;    /* DSP-command block length (cross-check) */
 /* Guest DMA buffer mapped directly: VDDRequestDMA returns 0 on this NTVDM, so
  * we read PCM straight from guest memory via VDDQueryDMA + MGetVdmPointer. */
 static const BYTE *sb_dma_ptr;     /* host pointer to the guest DMA buffer */
+static ULONG       sb_dma_lin;     /* guest linear addr of the DMA buffer (re-map each read) */
 static unsigned    sb_dma_len;     /* buffer length in bytes */
 static unsigned    sb_dma_pos;     /* play cursor within the buffer */
 static unsigned    sb_gate_wait;   /* render ticks spent waiting for a block-IRQ ack */
@@ -257,6 +258,7 @@ static void sb_start(int bits, int stereo, int sgnd, unsigned channel,
         sb_dma_pos = 0;
         /* LIVE pointer: read the guest buffer as it streams (do NOT snapshot -
          * the guest fills it just-in-time; a command-time snapshot is empty). */
+        sb_dma_lin = lin;
         sb_dma_ptr = (cnt > 1u) ? (const BYTE *)MGetVdmPointer(lin, cnt, FALSE)
                                 : NULL;
         logger_note_kv("sb: dma lin", (unsigned long)lin);
@@ -689,7 +691,15 @@ void sb_mix(int16_t *buf, unsigned frames)
                     }
                 }
 #else
-                CopyMemory(sb_snapshot, sb_dma_ptr + sb_dma_pos, want);
+                /* Re-resolve the guest pointer FRESH each read (VDMSound maps on
+                 * every transfer; we used to cache it once at sb_start - the
+                 * clearest deviation). [b48] */
+                {
+                    const BYTE *gp = (const BYTE *)MGetVdmPointer(sb_dma_lin,
+                                                                  sb_dma_len, FALSE);
+                    if (gp != NULL) CopyMemory(sb_snapshot, gp + sb_dma_pos, want);
+                    else            ZeroMemory(sb_snapshot, want);
+                }
                 if (sb_bits == 8 && sb_signed)
                     for (k = 0; k < want; k++) sb_snapshot[k] ^= 0x80u;
 #endif
@@ -752,6 +762,15 @@ void sb_mix(int16_t *buf, unsigned frames)
             logger_note_kv("sb: irq acks", (unsigned long)sb_irq_acks);
             logger_note_kv("sb: gate wait now", (unsigned long)sb_gate_wait);
             logger_note_kv("sb: live DMA count", (unsigned long)qi[1]);
+            /* DIAG(b48): hash the whole guest DMA buffer. If this CHANGES across
+             * windows the guest is refilling it (and we were reading stale);
+             * if CONSTANT the guest never refills (its mixer/timer is stuck). */
+            {
+                const BYTE *gp = (const BYTE *)MGetVdmPointer(sb_dma_lin, sb_dma_len, FALSE);
+                unsigned h = 2166136261u, z;
+                if (gp) for (z = 0; z < sb_dma_len; z++) h = (h ^ gp[z]) * 16777619u;
+                logger_note_kv("sb: guest buf hash", (unsigned long)h);
+            }
             sb_diag_tick_acc = 0;
         }
     }
