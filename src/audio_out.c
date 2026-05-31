@@ -357,7 +357,11 @@ int audio_init(void)
         ds = NULL;
         return 1;
     }
-    SetThreadPriority(render_thread, THREAD_PRIORITY_TIME_CRITICAL);
+    /* b49: ABOVE_NORMAL, not TIME_CRITICAL. TIME_CRITICAL + the single-core pin
+     * starved the guest CPU so its mixer couldn't refill the DMA buffer (b48:
+     * constant buffer hash). The big DS buffers (1.5 s PCM, 384 ms FM) tolerate
+     * a lower-priority feeder. */
+    SetThreadPriority(render_thread, THREAD_PRIORITY_ABOVE_NORMAL);
     return 0;
 }
 

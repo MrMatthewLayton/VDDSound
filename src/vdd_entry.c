@@ -121,17 +121,17 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID reserved)
         hVdd = (HANDLE)hinstDLL;
 
         logger_init();
-        logger_note("attach: vddsound build [b48-remap]");
-        /* Pin ntvdm.exe to one CPU. NTVDM's PIT/timer emulation reads host
-         * timing that is unstable across cores (unsynchronised TSCs, SpeedStep)
-         * on multi-core machines, which makes DOS programs that time themselves
-         * off the PIT (e.g. MIDIPLAY) speed up/slow down. Single-core affinity
-         * is the standard fix. Loader-lock-safe (kernel32, no LoadLibrary). */
-        if (SetProcessAffinityMask(GetCurrentProcess(), 1)) {
-            logger_note("attach: pinned ntvdm to CPU0 (timer stability)");
-        } else {
-            logger_note_kv("attach: affinity pin failed", GetLastError());
-        }
+        logger_note("attach: vddsound build [b49-unstarve]");
+        /* b49: do NOT pin ntvdm to one core. b48 proved the guest stops
+         * producing audio (its DMA buffer hash is constant - DOOM's mixer
+         * stalls, Skyroads' single-cycle buffer never finishes filling). The
+         * single-core pin forced the guest CPU thread and our TIME_CRITICAL
+         * render thread (with heavy OPL3 synth) onto the SAME core, where the
+         * audio thread starved the guest. Free the guest's CPU; the render
+         * thread is also dropped off TIME_CRITICAL (see audio_out.c). The old
+         * pin was for PIT/timer stability - re-add it (with a tamed render
+         * thread) only if timing regresses and audio is otherwise correct. */
+        logger_note("attach: CPU pin DISABLED (b49 - was starving the guest)");
         logger_note_kv("attach: pid", (unsigned long)GetCurrentProcessId());
         logger_note_kv("hVdd", (unsigned long)(ULONG_PTR)hVdd);
         opl_init(AUDIO_SAMPLE_RATE);
