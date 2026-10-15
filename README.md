@@ -1,5 +1,10 @@
 # vddsound
 
+> [!WARNING]
+> **This project is dead and is kept for reference only.**
+>
+> VDDSound tried to get sound working properly inside Windows XP's stock NTVDM, but we quickly ran into the limits of what a VDD can do in that host. It has been replaced by **[NTVDMEX](https://github.com/MrMatthewLayton/ntvdmex)**, a complete NTVDM replacement for Windows XP. Go there instead.
+
 A replacement **Virtual Sound Blaster** for Windows XP's NTVDM (the 16-bit DOS subsystem). `vddsound.dll` is a 32-bit Virtual Device Driver that loads into every NTVDM, traps the legacy sound ports, and routes DOS audio to the host:
 
 - **MIDI** (MPU-401, `0x330/0x331`) → Windows MIDI out (`winmm`)
@@ -11,7 +16,7 @@ Cross-built from **macOS** with MinGW-w64 (i686), CRT-free, depending only on DL
 
 ## Status
 
-Port ownership and FM/MIDI routing work on real XP SP3. The outstanding issue is DOS tempo/time distortion — a limitation of NTVDM's emulated timebase that affects native NTVDM and VDMSound equally, not this driver.
+**Abandoned** — superseded by [NTVDMEX](https://github.com/MrMatthewLayton/ntvdmex). At the time development stopped: port ownership and FM/MIDI routing work on real XP SP3. The outstanding issue is DOS tempo/time distortion — a limitation of NTVDM's emulated timebase that affects native NTVDM and VDMSound equally, not this driver.
 
 ## Documentation
 
